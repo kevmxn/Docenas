@@ -3,10 +3,12 @@
 Auto Roulette — Bot de señales para Docenas y Columnas
 Sistema AMX · Markov + Decision Tree ML + EMA 4/8/20
   - Señales para 2 docenas o 2 columnas simultáneas
-  - Mínimo 3 resultados consecutivos de la categoría excluida para señal
+  - Mínimo 2 resultados consecutivos de la categoría excluida para señal
+  - Umbral 80% de probabilidad para las dos docenas/columnas opuestas
   - EMA 4/8/20 sobre nivel acumulado confirma la señal
   - Árbol de decisión (sklearn) entrenado en tiempo real
   - Cadena de Markov para predicción de docena/columna
+  - Análisis de patrones (Color, Paridad, Rango) de los últimos 10 resultados
   - 2 intentos máximo (1 gale)
   - Stats: cada 20 señales + 24h (se actualiza a las 12:00 AR)
   - Persistencia SQLite 24/7
@@ -65,8 +67,8 @@ LIVE_DB   = "auto_roulette_live.db"
 BASE_BET          = 0.10
 MAX_ATTEMPTS      = 2    # 1 señal + 1 gale
 WARMUP_SPINS      = 25   # giros antes de emitir señales
-MIN_STREAK        = 3    # mínimo consecutivos para señal
-MIN_PROB          = 0.55 # umbral de probabilidad
+MIN_STREAK        = 2    # mínimo consecutivos para señal
+MIN_PROB          = 0.80 # umbral de probabilidad (80% para las dos opuestas)
 
 # ─── MAPAS ────────────────────────────────────────────────────────────────────
 REAL_COLOR_MAP: dict[int,str] = {
@@ -79,6 +81,58 @@ REAL_COLOR_MAP: dict[int,str] = {
     31:"NEGRO",32:"ROJO",33:"NEGRO",34:"ROJO",35:"NEGRO",36:"ROJO",
 }
 COLOR_EMOJI = {"ROJO":"🔴","NEGRO":"⚫️","VERDE":"🟢"}
+
+# ─── MAPAS DE PARIDAD Y RANGO ────────────────────────────────────────────────
+def get_parity(n: int) -> str:
+    """Retorna 'PAR' o 'IMPAR' (0='CERO')"""
+    if n == 0: return "CERO"
+    return "PAR" if n % 2 == 0 else "IMPAR"
+
+def get_range(n: int) -> str:
+    """Retorna 'BAJO'(1-18), 'ALTO'(19-36), o 'CERO'"""
+    if n == 0: return "CERO"
+    if n <= 18: return "BAJO"
+    return "ALTO"
+
+PARITY_EMOJI = {"PAR":"⚖️", "IMPAR":"⚡", "CERO":"🟢"}
+RANGE_EMOJI  = {"BAJO":"⬇️", "ALTO":"⬆️", "CERO":"🟢"}
+
+# Cuántos números de cada rango hay en cada docena/columna
+# BAJO=1-18, ALTO=19-36
+DOZEN_RANGE_WEIGHTS = {
+    1: {"BAJO": 12, "ALTO": 0},    # D1(1-12): 12 bajos, 0 altos
+    2: {"BAJO": 6,  "ALTO": 6},    # D2(13-24): 6 bajos, 6 altos
+    3: {"BAJO": 0,  "ALTO": 12},   # D3(25-36): 0 bajos, 12 altos
+}
+COLUMN_RANGE_WEIGHTS = {
+    1: {"BAJO": 6, "ALTO": 6},     # C1: 6 bajos(1,4,7,10,13,16), 6 altos(19,22,25,28,31,34)
+    2: {"BAJO": 6, "ALTO": 6},     # C2: 6 bajos(2,5,8,11,14,17), 6 altos(20,23,26,29,32,35)
+    3: {"BAJO": 6, "ALTO": 6},     # C3: 6 bajos(3,6,9,12,15,18), 6 altos(21,24,27,30,33,36)
+}
+
+# Qué paridad predomina en cada docena/columna
+DOZEN_PARITY_WEIGHTS = {
+    1: {"PAR": 6, "IMPAR": 6},    # D1(1-12): 6 pares, 6 impares
+    2: {"PAR": 6, "IMPAR": 6},    # D2(13-24): 6 pares, 6 impares
+    3: {"PAR": 6, "IMPAR": 6},    # D3(25-36): 6 pares, 6 impares
+}
+COLUMN_PARITY_WEIGHTS = {
+    1: {"PAR": 4, "IMPAR": 4},    # C1(1,4,7,10,13,16,19,22): 4 pares, 4 impares
+    2: {"PAR": 4, "IMPAR": 4},    # C2(2,5,8,11,14,17,20,23): 4 pares, 4 impares
+    3: {"PAR": 4, "IMPAR": 4},    # C3(3,6,9,12,15,18,21,24): 4 pares, 4 impares
+}
+
+# Qué color predomina en cada docena/columna (conteo de números de cada color)
+DOZEN_COLOR_WEIGHTS = {
+    1: {"ROJO": 6, "NEGRO": 6},   # D1: 6R, 6N
+    2: {"ROJO": 6, "NEGRO": 6},   # D2: 6R, 6N
+    3: {"ROJO": 6, "NEGRO": 6},   # D3: 6R, 6N
+}
+COLUMN_COLOR_WEIGHTS = {
+    1: {"ROJO": 4, "NEGRO": 4},   # C1: 4R, 4N
+    2: {"ROJO": 4, "NEGRO": 4},   # C2: 4R, 4N
+    3: {"ROJO": 4, "NEGRO": 4},   # C3: 4R, 4N
+}
 
 def get_dozen(n: int) -> int:
     """0=VERDE, 1=D1(1-12), 2=D2(13-24), 3=D3(25-36)"""
@@ -221,6 +275,158 @@ class MarkovPredictor:
         tot = sum(c.values())
         if tot < 3: return None
         return {k: v/tot for k,v in c.items()}
+
+# ─── PATTERN ANALYZER (Color, Paridad, Rango) ────────────────────────────────
+class PatternAnalyzer:
+    """
+    Analiza los últimos 10 resultados clasificándolos por Color, Paridad y Rango.
+    Determina qué docenas/columnas son más probables según los patrones observados.
+
+    Rango: BAJO (1-18) y ALTO (19-36)
+
+    Este análisis es COMPLEMENTARIO a la señal original (Markov+DT+EMA).
+    No modifica la probabilidad ni el formato de la señal.
+    Se almacena internamente y se registra en logs para análisis profundo.
+    """
+    WINDOW = 10
+
+    def __init__(self):
+        self.last_analysis: Optional[dict] = None
+
+    def analyze(self, spin_history: list) -> dict:
+        """
+        Analiza los últimos 10 resultados y retorna:
+        - Patrones predominantes (color, paridad, rango)
+        - Para cada docena y columna: score de probabilidad según patrones
+        - Qué docenas/columnas son más probables según cada categoría
+        """
+        if len(spin_history) < self.WINDOW:
+            return self._empty_analysis()
+
+        recent = spin_history[-self.WINDOW:]
+
+        # ── Contar patrones ──────────────────────────────────────────────
+        color_counts  = {"ROJO": 0, "NEGRO": 0, "VERDE": 0}
+        parity_counts = {"PAR": 0, "IMPAR": 0, "CERO": 0}
+        range_counts  = {"BAJO": 0, "ALTO": 0, "CERO": 0}
+
+        for entry in recent:
+            n = entry["number"]
+            color_counts[entry["color"]] += 1
+            parity_counts[get_parity(n)] += 1
+            range_counts[get_range(n)] += 1
+
+        # Patrones predominantes (el más frecuente, excluyendo VERDE/CERO)
+        dominant_color  = max((k for k in color_counts if k != "VERDE"),
+                             key=lambda k: color_counts[k], default="ROJO")
+        dominant_parity = max((k for k in parity_counts if k != "CERO"),
+                             key=lambda k: parity_counts[k], default="IMPAR")
+        dominant_range  = max((k for k in range_counts if k != "CERO"),
+                             key=lambda k: range_counts[k], default="BAJO")
+
+        # ── Calcular scores por docena ───────────────────────────────────
+        # Para cada docena, qué tan compatible es con los 3 patrones dominantes
+        # Cada componente va de 0 a 1
+
+        dozen_scores = {}
+        for d in (1, 2, 3):
+            total_nums = 12  # cada docena tiene 12 números
+
+            # Color: fracción de números de la docena que son del color dominante
+            color_match = DOZEN_COLOR_WEIGHTS[d].get(dominant_color, 0) / total_nums
+
+            # Paridad: fracción de números de la docena que son de la paridad dominante
+            parity_match = DOZEN_PARITY_WEIGHTS[d].get(dominant_parity, 0) / total_nums
+
+            # Rango: fracción de números de la docena que están en el rango dominante
+            range_match = DOZEN_RANGE_WEIGHTS[d].get(dominant_range, 0) / total_nums
+
+            dozen_scores[d] = (color_match + parity_match + range_match) / 3.0
+
+        # ── Calcular scores por columna ──────────────────────────────────
+        column_scores = {}
+        for c in (1, 2, 3):
+            total_nums = 12  # cada columna tiene 12 números
+
+            # Color: fracción de números de la columna que son del color dominante
+            color_match = COLUMN_COLOR_WEIGHTS[c].get(dominant_color, 0) / total_nums
+
+            # Paridad: fracción de números de la columna que son de la paridad dominante
+            parity_match = COLUMN_PARITY_WEIGHTS[c].get(dominant_parity, 0) / total_nums
+
+            # Rango: fracción de números de la columna que están en el rango dominante
+            range_match = COLUMN_RANGE_WEIGHTS[c].get(dominant_range, 0) / total_nums
+
+            column_scores[c] = (color_match + parity_match + range_match) / 3.0
+
+        # ── Normalizar scores ────────────────────────────────────────────
+        total_d = sum(dozen_scores.values())
+        total_c = sum(column_scores.values())
+        if total_d > 0:
+            dozen_scores = {k: v/total_d for k, v in dozen_scores.items()}
+        else:
+            dozen_scores = {k: 1/3 for k in (1,2,3)}
+        if total_c > 0:
+            column_scores = {k: v/total_c for k, v in column_scores.items()}
+        else:
+            column_scores = {k: 1/3 for k in (1,2,3)}
+
+        # ── Determinar docenas/columnas más probables por categoría ──────
+        # Color → qué docenas/columnas favorece
+        best_dozen_by_color = max((1,2,3), key=lambda d: DOZEN_COLOR_WEIGHTS[d].get(dominant_color, 0))
+        best_column_by_color = max((1,2,3), key=lambda c: COLUMN_COLOR_WEIGHTS[c].get(dominant_color, 0))
+
+        # Paridad → qué docenas/columnas favorece
+        best_dozen_by_parity = max((1,2,3), key=lambda d: DOZEN_PARITY_WEIGHTS[d].get(dominant_parity, 0))
+        best_column_by_parity = max((1,2,3), key=lambda c: COLUMN_PARITY_WEIGHTS[c].get(dominant_parity, 0))
+
+        # Rango → qué docenas/columnas favorece
+        best_dozen_by_range = max((1,2,3), key=lambda d: DOZEN_RANGE_WEIGHTS[d].get(dominant_range, 0))
+        best_column_by_range = max((1,2,3), key=lambda c: COLUMN_RANGE_WEIGHTS[c].get(dominant_range, 0))
+
+        analysis = {
+            "color_counts":    color_counts,
+            "parity_counts":   parity_counts,
+            "range_counts":    range_counts,
+            "dominant_color":  dominant_color,
+            "dominant_parity": dominant_parity,
+            "dominant_range":  dominant_range,
+            "dozen_scores":    dozen_scores,
+            "column_scores":   column_scores,
+            "best_dozen_by_color":  best_dozen_by_color,
+            "best_column_by_color": best_column_by_color,
+            "best_dozen_by_parity": best_dozen_by_parity,
+            "best_column_by_parity":best_column_by_parity,
+            "best_dozen_by_range":  best_dozen_by_range,
+            "best_column_by_range": best_column_by_range,
+            "color_pct":  round(color_counts[dominant_color] / self.WINDOW * 100, 0),
+            "parity_pct": round(parity_counts[dominant_parity] / self.WINDOW * 100, 0),
+            "range_pct":  round(range_counts[dominant_range] / self.WINDOW * 100, 0),
+        }
+        self.last_analysis = analysis
+        return analysis
+
+    def _empty_analysis(self) -> dict:
+        return {
+            "color_counts":    {"ROJO": 0, "NEGRO": 0, "VERDE": 0},
+            "parity_counts":   {"PAR": 0, "IMPAR": 0, "CERO": 0},
+            "range_counts":    {"BAJO": 0, "ALTO": 0, "CERO": 0},
+            "dominant_color":  "ROJO",
+            "dominant_parity": "IMPAR",
+            "dominant_range":  "BAJO",
+            "dozen_scores":    {1: 1/3, 2: 1/3, 3: 1/3},
+            "column_scores":   {1: 1/3, 2: 1/3, 3: 1/3},
+            "best_dozen_by_color":  1,
+            "best_column_by_color": 1,
+            "best_dozen_by_parity": 1,
+            "best_column_by_parity":1,
+            "best_dozen_by_range":  1,
+            "best_column_by_range": 1,
+            "color_pct":  0,
+            "parity_pct": 0,
+            "range_pct":  0,
+        }
+
 
 # ─── DECISION TREE ML ─────────────────────────────────────────────────────────
 class DecisionTreePredictor:
@@ -381,6 +587,7 @@ class AutoRouletteEngine:
         self.markov_c = MarkovPredictor()
         self.dt_d     = DecisionTreePredictor()
         self.dt_c     = DecisionTreePredictor()
+        self.pattern_analyzer = PatternAnalyzer()
 
         # Rachas actuales
         self.dozen_streak  = 0   # racha de la última docena
@@ -398,6 +605,7 @@ class AutoRouletteEngine:
         self.attempts_left:  int            = MAX_ATTEMPTS
         self.signal_msg_ids: list           = []
         self.gale_active:    bool           = False
+        self.signal_pattern_analysis: Optional[dict] = None  # análisis de patrones
 
         # Bankroll simple
         self.bankroll: float = 0.0
@@ -537,11 +745,17 @@ class AutoRouletteEngine:
         """
         Busca señal en docenas y columnas.
         Condiciones:
-          1. Racha ≥ MIN_STREAK de la misma docena/columna
+          1. Racha ≥ MIN_STREAK (2) de la misma docena/columna
           2. EMA confirma reversión en el nivel acumulado de esa categoría
-          3. Probabilidad unificada del excluido ≥ MIN_PROB (sigue dominando → apostamos los otros)
+          3. Probabilidad ajustada ≥ MIN_PROB (80% para las dos opuestas)
+
+        Probabilidad ajustada = 70% ML (Markov+DT) + 30% Patrones (Color,Paridad,Rango)
+        Los patrones AUMENTAN la probabilidad de las dos docenas/columnas apostadas.
         """
         best = None
+
+        # ── Análisis de patrones ────────────────────────────────────────────
+        pattern_analysis = self.pattern_analyzer.analyze(self.spin_history)
 
         # ── Docenas ───────────────────────────────────────────────────────────
         dh = [x for x in self.dozen_history if x != 0]
@@ -552,10 +766,20 @@ class AutoRouletteEngine:
             levels = self.dozen_levels.get(excl, [])
             if ema_signal(levels, "moderado"):
                 pair   = DOZEN_PAIRS[excl]
-                prob   = self._unified_prob("dozen", excl, excl)
-                if prob >= MIN_PROB:
-                    best = {"type":"dozen","excl":excl,"pair":pair,"prob":prob,
-                            "streak":self.dozen_streak}
+                # Probabilidad ML de que la categoría excluida aparezca
+                prob_excl = self._unified_prob("dozen", excl, excl)
+                # Probabilidad ML de las dos docenas OPUESTAS (las que se apuestan)
+                prob_ml = 1 - prob_excl
+                # Alineación de patrones con las dos docenas de la apuesta
+                pa = pattern_analysis
+                pattern_alignment = pa["dozen_scores"][pair[0]] + pa["dozen_scores"][pair[1]]
+                # Probabilidad ajustada: 70% ML + 30% Patrones
+                adjusted_prob = 0.7 * prob_ml + 0.3 * pattern_alignment
+                if adjusted_prob >= MIN_PROB:
+                    best = {"type":"dozen","excl":excl,"pair":pair,"prob":adjusted_prob,
+                            "prob_ml":prob_ml,"prob_pattern":pattern_alignment,
+                            "streak":self.dozen_streak,
+                            "pattern_analysis":pattern_analysis}
 
         # ── Columnas ──────────────────────────────────────────────────────────
         ch = [x for x in self.column_history if x != 0]
@@ -566,11 +790,17 @@ class AutoRouletteEngine:
             levels = self.column_levels.get(excl, [])
             if ema_signal(levels, "moderado"):
                 pair   = COLUMN_PAIRS[excl]
-                prob   = self._unified_prob("column", excl, excl)
-                if prob >= MIN_PROB:
-                    cand = {"type":"column","excl":excl,"pair":pair,"prob":prob,
-                            "streak":self.column_streak}
-                    if best is None or prob > best["prob"]:
+                prob_excl = self._unified_prob("column", excl, excl)
+                prob_ml = 1 - prob_excl
+                pa = pattern_analysis
+                pattern_alignment = pa["column_scores"][pair[0]] + pa["column_scores"][pair[1]]
+                adjusted_prob = 0.7 * prob_ml + 0.3 * pattern_alignment
+                if adjusted_prob >= MIN_PROB:
+                    cand = {"type":"column","excl":excl,"pair":pair,"prob":adjusted_prob,
+                            "prob_ml":prob_ml,"prob_pattern":pattern_alignment,
+                            "streak":self.column_streak,
+                            "pattern_analysis":pattern_analysis}
+                    if best is None or adjusted_prob > best["prob"]:
                         best = cand
 
         return best
@@ -583,10 +813,8 @@ class AutoRouletteEngine:
     def _build_signal_text(self, sig: dict, trigger_n: int, trigger_c: str,
                             attempt: int) -> str:
         c_emoji = COLOR_EMOJI.get(trigger_c, "")
-        a_str   = "1er" if attempt == 1 else "2do (🎲 GALE)"
         b1      = self._fmt_cat(sig["type"], sig["pair"][0])
         b2      = self._fmt_cat(sig["type"], sig["pair"][1])
-        label   = "DOCENA" if sig["type"] == "dozen" else "COLUMNA"
         return (
             f"✅✅ <b>SEÑAL CONFIRMADA</b> ✅✅\n\n"
             f"🌟 ENTRAR DESPUÉS: {trigger_n} {trigger_c} {c_emoji}\n"
@@ -622,8 +850,27 @@ class AutoRouletteEngine:
         text   = self._build_signal_text(sig, trigger_n, trigger_c, attempt)
         msg_id = tg_send(text)
         if msg_id: self.signal_msg_ids.append(msg_id)
+        prob_ml = sig.get('prob_ml', 0)
+        prob_pat = sig.get('prob_pattern', 0)
         logger.info(f"[Auto] 🎯 Señal {sig['type']} excl={sig['excl']} "
-                    f"pair={sig['pair']} prob={sig['prob']:.0%} intento={attempt}")
+                    f"pair={sig['pair']} prob={sig['prob']:.0%} "
+                    f"(ML:{prob_ml:.0%} + Patrón:{prob_pat:.0%}) "
+                    f"intento={attempt}")
+        # Log detallado de patrones (interno, no va a Telegram)
+        pa = sig.get("pattern_analysis")
+        if pa:
+            dc  = pa["dominant_color"]
+            dp  = pa["dominant_parity"]
+            dr  = pa["dominant_range"]
+            ds  = pa["dozen_scores"]
+            cs  = pa["column_scores"]
+            logger.info(
+                f"[Auto] 📋 Patrones → Color:{dc}({pa['color_pct']:.0f}%) "
+                f"Paridad:{dp}({pa['parity_pct']:.0f}%) "
+                f"Rango:{dr}({pa['range_pct']:.0f}%) "
+                f"| Docenas D1:{ds[1]:.0%} D2:{ds[2]:.0%} D3:{ds[3]:.0%} "
+                f"| Columnas C1:{cs[1]:.0%} C2:{cs[2]:.0%} C3:{cs[3]:.0%}"
+            )
 
     def _send_result(self, number: int, color: str, won: bool,
                      cat_type: str, winning_cat: int):
@@ -729,11 +976,20 @@ class AutoRouletteEngine:
             if self.attempts_left > 0:
                 # Gale: reenviar señal para el 2do intento
                 self.gale_active = True
+                # Re-analizar patrones actualizados para el gale
+                pa = self.pattern_analyzer.analyze(self.spin_history)
+                if self.signal_type == "dozen":
+                    pat_align = pa["dozen_scores"][self.signal_pair[0]] + pa["dozen_scores"][self.signal_pair[1]]
+                else:
+                    pat_align = pa["column_scores"][self.signal_pair[0]] + pa["column_scores"][self.signal_pair[1]]
                 sig = {
                     "type": self.signal_type,
                     "excl": self.signal_excl,
                     "pair": self.signal_pair,
-                    "prob": 0.0,
+                    "prob": 0.7 * (1 - self._unified_prob(self.signal_type, self.signal_excl, self.signal_excl)) + 0.3 * pat_align,
+                    "prob_ml": 1 - self._unified_prob(self.signal_type, self.signal_excl, self.signal_excl),
+                    "prob_pattern": pat_align,
+                    "pattern_analysis": pa,
                 }
                 self._send_signal(sig, number, color, 2)
             else:
@@ -758,6 +1014,7 @@ class AutoRouletteEngine:
         self.attempts_left = MAX_ATTEMPTS
         self.gale_active   = False
         self.signal_msg_ids = []
+        self.signal_pattern_analysis = None
 
     # ── Proceso principal ─────────────────────────────────────────────────────
     def process_number(self, number: int):
@@ -802,6 +1059,7 @@ class AutoRouletteEngine:
                 self.attempts_left = MAX_ATTEMPTS
                 self.signal_trigger_number = number
                 self.signal_trigger_color  = color
+                self.signal_pattern_analysis = sig.get("pattern_analysis")
                 self._send_signal(sig, number, color, 1)
 
     # ── WebSocket ─────────────────────────────────────────────────────────────
@@ -908,8 +1166,10 @@ def cmd_start(message):
     bot.reply_to(message,
         "<b>🎰 Auto Roulette Bot AMX</b>\n\n"
         "<b>Señales:</b> Docenas + Columnas\n"
-        "<b>Sistema:</b> EMA 4/8/20 + Markov + Árbol de Decisión\n"
-        "<b>Min. racha:</b> 3 resultados consecutivos\n"
+        "<b>Sistema:</b> EMA 4/8/20 + Markov + Árbol de Decisión + Patrones\n"
+        "<b>Min. racha:</b> 2 resultados consecutivos\n"
+        "<b>Umbral prob:</b> 80% para las dos opuestas\n"
+        "<b>Patrones:</b> Color + Paridad + Rango (últimos 10)\n"
         "<b>Max gale:</b> 1 intento adicional\n\n"
         "Comandos:\n"
         "/status - Estado actual\n"
@@ -992,3 +1252,4 @@ if __name__=="__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot detenido.")
+
