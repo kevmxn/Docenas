@@ -64,7 +64,7 @@ BASE_BET     = 0.10
 MAX_ATTEMPTS = 2     # 1 señal + 1 gale
 WARMUP_SPINS = 25
 MIN_STREAK   = 2     # racha mínima para señal principal
-MIN_PROB     = 0.62  # umbral probabilidad unificada
+MIN_PROB     = 0.58  # umbral probabilidad unificada (ajustable con /umbral)
 
 # ─── MAPAS ────────────────────────────────────────────────────────────────────
 REAL_COLOR_MAP: dict[int, str] = {
@@ -98,6 +98,23 @@ def _get_db() -> sqlite3.Connection:
             id     INTEGER PRIMARY KEY AUTOINCREMENT,
             number INTEGER NOT NULL,
             ts     INTEGER NOT NULL
+        )
+    """)
+    # Tabla de patrones Markov persistida (orden 1 y 2)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS markov_counts (
+            pattern TEXT NOT NULL,
+            result  INTEGER NOT NULL,
+            count   INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (pattern, result)
+        )
+    """)
+    # Tabla de muestras DT persistida
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS dt_samples (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            features TEXT NOT NULL,
+            target   INTEGER NOT NULL
         )
     """)
     conn.commit()
@@ -411,16 +428,48 @@ class AutoRouletteEngine:
     # ── Persistencia ──────────────────────────────────────────────────────────
     def _load_live_history(self) -> int:
         try:
-            cutoff = int(time.time()) - 7*86400
-            rows   = self._db.execute(
-                "SELECT number FROM live_spins WHERE ts>=? ORDER BY id ASC", (cutoff,)
+            # Cargar TODOS los giros guardados — sin límite de fecha
+            rows = self._db.execute(
+                "SELECT number FROM live_spins ORDER BY id ASC"
             ).fetchall()
         except Exception as e:
             logger.warning(f"[Auto] Error cargando historial: {e}")
             return 0
+
+        # Restaurar patrones Markov desde DB
+        try:
+            pat_rows = self._db.execute(
+                "SELECT pattern, result, count FROM markov_counts"
+            ).fetchall()
+            for (pattern_str, result, count) in pat_rows:
+                pattern = tuple(int(x) for x in pattern_str.split(","))
+                self.markov.counts1[pattern][result] += count
+                if len(pattern) == 2:
+                    self.markov.counts2[pattern][result] += count
+        except Exception as e:
+            logger.debug(f"[Auto] Patrones Markov no cargados: {e}")
+
+        # Restaurar muestras DT desde DB
+        try:
+            dt_rows = self._db.execute(
+                "SELECT features, target FROM dt_samples"
+            ).fetchall()
+            for (feats_str, target) in dt_rows:
+                feats = [float(x) for x in feats_str.split(",")]
+                self.dt.X.append(feats)
+                self.dt.y.append(int(target))
+            if len(self.dt.X) >= 30:
+                self.dt._train()
+        except Exception as e:
+            logger.debug(f"[Auto] Muestras DT no cargadas: {e}")
+
+        # Aplicar giros al estado (solo para historial en memoria / EMA)
         for (n,) in rows:
-            self._update_state(n, persist=False)
-        logger.info(f"[Auto] ✅ {len(rows)} giros cargados")
+            self._update_state(n, persist=False, save_patterns=False)
+
+        logger.info(f"[Auto] ✅ {len(rows)} giros + "
+                    f"{len(self.dt.X)} muestras DT + "
+                    f"Markov {'OK' if self.markov.counts1 else 'vacío'} cargados")
         return len(rows)
 
     def _persist(self, number: int):
@@ -443,15 +492,16 @@ class AutoRouletteEngine:
                 logger.error(f"[Auto] SQLite irrecuperable: {e2}")
 
     # ── Actualizar estado ──────────────────────────────────────────────────────
-    def _update_state(self, number: int, persist: bool = True):
+    def _update_state(self, number: int, persist: bool = True,
+                      save_patterns: bool = True):
         color  = REAL_COLOR_MAP.get(number, "VERDE")
         column = get_column(number)
 
         self.spin_history.append({"number":number,"color":color,"column":column})
-        if len(self.spin_history) > 300: self.spin_history.pop(0)
+        if len(self.spin_history) > 500: self.spin_history.pop(0)
 
         self.column_history.append(column)
-        if len(self.column_history) > 300: self.column_history.pop(0)
+        if len(self.column_history) > 500: self.column_history.pop(0)
 
         # Racha
         if column != 0:
@@ -461,22 +511,67 @@ class AutoRouletteEngine:
                 self.last_column   = column
                 self.column_streak = 1
 
-        # Niveles acumulados
+        # Niveles acumulados (sin límite para predicciones futuras)
         for c in (1, 2, 3):
             if column != 0:
                 delta = 1 if column == c else -1
                 prev  = self.column_levels[c][-1] if self.column_levels[c] else 0
                 self.column_levels[c].append(prev + delta)
-                if len(self.column_levels[c]) > 300: self.column_levels[c].pop(0)
+                if len(self.column_levels[c]) > 500: self.column_levels[c].pop(0)
 
-        # Entrenar predictores
+        # Actualizar Markov
         self.markov.update(self.column_history)
+
+        # Agregar muestra al DT
         if column != 0 and len(self.column_levels[column]) > 5:
-            self.dt.add_sample(
+            sample = self.dt.add_sample_return(
                 self.column_history, self.column_levels[column], self.column_streak)
+            # Persistir muestra DT en DB
+            if save_patterns and sample:
+                self._persist_dt_sample(sample["features"], sample["target"])
+            # Persistir conteos Markov en DB
+            if save_patterns:
+                self._persist_markov_update(self.column_history)
 
         if persist:
             self._persist(number)
+
+    def _persist_dt_sample(self, features: list, target: int):
+        """Guarda una muestra del DT en SQLite."""
+        try:
+            feats_str = ",".join(str(round(f, 4)) for f in features)
+            self._db.execute(
+                "INSERT INTO dt_samples(features, target) VALUES(?,?)",
+                (feats_str, target)
+            )
+            self._db.commit()
+        except Exception as e:
+            logger.debug(f"[Auto] Error guardando muestra DT: {e}")
+
+    def _persist_markov_update(self, history: list):
+        """Actualiza conteos de Markov en SQLite (incrementa o inserta)."""
+        h = [x for x in history if x != 0]
+        if len(h) < 2: return
+        try:
+            # Orden 1
+            p1  = str(h[-2])
+            res = h[-1]
+            self._db.execute(
+                "INSERT INTO markov_counts(pattern,result,count) VALUES(?,?,1) "
+                "ON CONFLICT(pattern,result) DO UPDATE SET count=count+1",
+                (p1, res)
+            )
+            # Orden 2
+            if len(h) >= 3:
+                p2 = f"{h[-3]},{h[-2]}"
+                self._db.execute(
+                    "INSERT INTO markov_counts(pattern,result,count) VALUES(?,?,1) "
+                    "ON CONFLICT(pattern,result) DO UPDATE SET count=count+1",
+                    (p2, res)
+                )
+            self._db.commit()
+        except Exception as e:
+            logger.debug(f"[Auto] Error guardando Markov: {e}")
 
     # ── Probabilidad unificada ────────────────────────────────────────────────
     def _unified_prob(self, excl: int) -> dict:
@@ -508,8 +603,8 @@ class AutoRouletteEngine:
         pair_prob = round(1.0 - combined, 4)
         return {"excl_prob": round(combined, 4), "pair_prob": pair_prob, "source": source}
 
-    def _freq_prob(self, excl: int, window: int = 15) -> float:
-        """Frecuencia relativa de la columna excluida en los últimos N giros."""
+    def _freq_prob(self, excl: int, window: int = 10) -> float:
+        """Frecuencia relativa de la columna excluida en los últimos 10 giros."""
         h = [x for x in self.column_history if x != 0][-window:]
         if not h: return 1/3
         return h.count(excl) / len(h)
@@ -537,7 +632,7 @@ class AutoRouletteEngine:
             levels = self.column_levels.get(excl, [])
             probs  = self._unified_prob(excl)
             pp     = probs["pair_prob"]   # prob de las dos apostadas
-            freq   = self._freq_prob(excl, window=15)
+            freq   = self._freq_prob(excl, window=10)
 
             # ── Modo 1: EMA moderado ─────────────────────────────────────
             if (self.column_streak >= MIN_STREAK and
@@ -563,7 +658,7 @@ class AutoRouletteEngine:
             dt_pred = self.dt.predict(
                 self.column_history, levels, self.column_streak)
             if (dt_pred and
-                    dt_pred.get(excl, 0) >= 0.70 and
+                    dt_pred.get(excl, 0) >= 0.65 and
                     self.column_streak >= 1 and
                     self.last_column == excl):
                 dt_excl = dt_pred.get(excl, 0)
@@ -575,7 +670,7 @@ class AutoRouletteEngine:
                     })
 
             # ── Modo 4: Frecuencia dominante ─────────────────────────────
-            if (freq >= 0.50 and
+            if (freq >= 0.45 and
                     self.column_streak >= MIN_STREAK and
                     self.last_column == excl and
                     pp >= MIN_PROB):
@@ -929,6 +1024,24 @@ def cmd_stats(message):
         f"💰 {sd['bk']:+.2f} usd"
     )
     bot.reply_to(message, text, parse_mode="HTML")
+
+
+@bot.message_handler(commands=['umbral'])
+def cmd_umbral(message):
+    global MIN_PROB
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        pct = str(int(MIN_PROB * 100))
+        bot.reply_to(message, '🎚 Umbral actual: ' + pct + '% | Uso: /umbral 58 (rango 45-80)', parse_mode='HTML')
+        return
+    try:
+        val = int(parts[1])
+        if not (45 <= val <= 80): raise ValueError
+        MIN_PROB = round(val / 100, 2)
+        logger.info(f'[Auto] Umbral cambiado a {MIN_PROB}')
+        bot.reply_to(message, '✅ Umbral actualizado: ' + str(val) + '% | Próximas señales requerirán >= ' + str(val) + '%', parse_mode='HTML')
+    except ValueError:
+        bot.reply_to(message, '⚠️ Valor inválido. Ejemplo: /umbral 58', parse_mode='HTML')
 
 @bot.message_handler(commands=['reset'])
 def cmd_reset(message):
