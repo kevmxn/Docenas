@@ -263,9 +263,11 @@ class DecisionTreePredictor:
         total = len(h)
         return {c: h.count(c)/total for c in (1,2,3)}
 
-    def add_sample(self, history: list, levels: list, streak: int):
+    def add_sample_return(self, history: list, levels: list, streak: int) -> Optional[dict]:
+        """Agrega muestra, entrena si aplica, retorna para persistencia."""
         h = [x for x in history if x != 0]
-        if len(h) < self.WINDOW + 1: return
+        if len(h) < self.WINDOW + 1:
+            return None
         target  = h[-1]
         prev_h  = h[:-1]
         lv_prev = levels[:-1] if len(levels) > 1 else levels
@@ -281,6 +283,11 @@ class DecisionTreePredictor:
         self.y.append(target)
         if len(self.X) >= 30 and len(self.X) % 5 == 0:
             self._train()
+        return {"features": feats, "target": target}
+
+    def add_sample(self, history: list, levels: list, streak: int):
+        """Alias para compatibilidad."""
+        self.add_sample_return(history, levels, streak)
 
     def _train(self):
         if len(set(self.y)) < 2: return
