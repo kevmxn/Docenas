@@ -470,11 +470,11 @@ class SpeedRouletteEngine:
         nums = sorted([p[1:] for p in self.active_pair])
         pair_disp = f"{nums[0]} y {nums[1]}"
         type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
-        return (f"🎰 ENTRADA CONFIRMADA 🎰\n\n"
-                f"🎮 Roulette Speed\n"
+        return (f"✅ ENTRADA CONFIRMADA ✅\n\n"
+                f"🕹️ Roulette Speed\n"
                 f"🎯 Entrar en las {type_str}: {pair_disp}\n"
                 f"💰 Balance: {self.bankroll:.2f}\n"
-                f"💸 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
+                f"💵 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
                 f"⚔️ Cubrir el CERO 🟢\n"
                 f"🛟 Max: 1 Gales")
 
