@@ -12,6 +12,7 @@ Sistema PF + PH + ML Cruzado + Gestión Docenas (6 niveles, 2 oportunidades)
   - EMPATE (cero): termina la señal, sin cambio de bankroll.
   - Sin base de datos de pre-entrenamiento.
   - WS Key: 203
+  - Consulta de datos cada 1s para alta velocidad
 """
 
 import asyncio
@@ -19,7 +20,6 @@ import json
 import logging
 import math
 import os
-import re
 import sqlite3
 import threading
 import time
@@ -470,11 +470,11 @@ class SpeedRouletteEngine:
         nums = sorted([p[1:] for p in self.active_pair])
         pair_disp = f"{nums[0]} y {nums[1]}"
         type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
-        return (f"✅ ENTRADA CONFIRMADA ✅\n\n"
-                f"🕹️ Roulette Speed\n"
+        return (f"🎰 ENTRADA CONFIRMADA 🎰\n\n"
+                f"🎮 Roulette Speed\n"
                 f"🎯 Entrar en las {type_str}: {pair_disp}\n"
                 f"💰 Balance: {self.bankroll:.2f}\n"
-                f"💵 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
+                f"💸 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
                 f"⚔️ Cubrir el CERO 🟢\n"
                 f"🛟 Max: 1 Gales")
 
@@ -576,35 +576,51 @@ class SpeedRouletteEngine:
                 self._send_signal()
                 logger.info(f"[SpeedDC] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
 
+    # ─── WebSocket Alta Velocidad (1s timeout) ────────────────────────────────
     async def run_ws(self):
         reconnect_delay = 5
         while True:
             try:
-                async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10) as ws:
+                # Reducido ping a 5s para mantener la conexión muy activa en Speed Roulette
+                async with websockets.connect(WS_URL, ping_interval=5, ping_timeout=10, close_timeout=10) as ws:
                     await ws.send(json.dumps({"type": "subscribe", "key": WS_KEY, "casinoId": CASINO_ID}))
                     logger.info(f"[SpeedDC] ✅ WS conectado — Speed Roulette key={WS_KEY}")
                     reconnect_delay = 5
-                    async for raw in ws:
-                        try: data = json.loads(raw)
-                        except: continue
-                        if not isinstance(data, dict): continue
-                        results = data.get("last20Results")
-                        if results and isinstance(results, list):
-                            latest = results[0]
-                            gid = str(latest.get("gameId", ""))
-                            if gid == self.last_game_id: continue
-                            self.last_game_id = gid
-                            try: n = int(latest.get("result", ""))
-                            except: continue
-                            if 0 <= n <= 36: self.process_number(n)
+                    
+                    # Bucle activo con timeout de 1 segundo para consultar datos constantemente
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                            try: 
+                                data = json.loads(raw)
+                            except: 
+                                continue
+                                
+                            if not isinstance(data, dict): continue
+                            results = data.get("last20Results")
+                            if results and isinstance(results, list):
+                                latest = results[0]
+                                gid = str(latest.get("gameId", ""))
+                                if gid == self.last_game_id: continue
+                                self.last_game_id = gid
+                                try: n = int(latest.get("result", ""))
+                                except: continue
+                                if 0 <= n <= 36: self.process_number(n)
+                                continue
+                                
+                            for key in ("result", "number", "outcome", "winningNumber"):
+                                if key in data:
+                                    try:
+                                        n = int(data[key])
+                                        if 0 <= n <= 36: self.process_number(n)
+                                    except: pass
+                                    break
+                                    
+                        except asyncio.TimeoutError:
+                            # Se ejecuta cada 1 segundo si no hay datos, permite mantener 
+                            # el botón de consulta presionado y procesar tareas en segundo plano
                             continue
-                        for key in ("result", "number", "outcome", "winningNumber"):
-                            if key in data:
-                                try:
-                                    n = int(data[key])
-                                    if 0 <= n <= 36: self.process_number(n)
-                                except: pass
-                                break
+                            
             except Exception as e:
                 logger.warning(f"[SpeedDC] WS desconectado: {e}. Recon en {reconnect_delay}s")
                 await asyncio.sleep(reconnect_delay)
@@ -656,7 +672,7 @@ async def main():
     global engine
     engine = SpeedRouletteEngine()
     threading.Thread(target=lambda: bot.polling(none_stop=True, interval=1, timeout=30), daemon=True).start()
-    logger.info("[SpeedDC] 🎰 Bot Speed iniciado — key=203")
+    logger.info("[SpeedDC] 🎰 Bot Speed iniciado — key=203 (Modo Alta Velocidad 1s)")
     await asyncio.gather(asyncio.create_task(engine.run_ws()), asyncio.create_task(self_ping_loop()))
 
 if __name__ == "__main__":
