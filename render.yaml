@@ -1,0 +1,11 @@
+# render.yaml — Roulette Signal Bot
+services:
+  - type: web
+    name: roulette-signal-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free           # change to "starter" for 24/7 uptime
+    healthCheckPath: /ping
+    envVars:
+      - key: PORT
+        value: 10000
