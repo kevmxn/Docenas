@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-Speed Roulette — Bot de señales para Docenas y Columnas
+Speed Roulette 1 — Bot de señales para Docenas y Columnas
 Sistema PF + PH + ML Cruzado + Gestión Docenas (6 niveles, 2 oportunidades)
 
   - Capital inicial: 0
   - Apuesta base: 0.50 por docena/columna
   - Gestión: 6 niveles con 2 oportunidades (Gale #0 y Gale #1) por señal.
       · Gale #0 → apuesta = nivel × BASE_BET
-      · Gale #1 → apuesta = déficit hasta objetivo + BASE_BET
-  - Si se pierde Gale #1: registra deuda (B0) y sube de nivel. Usa ficha base del nivel.
+      · Gale #1 → apuesta = 3 × (nivel × BASE_BET)  [Gestión conservadora x3]
+  - Si se pierde Gale #1: registra deuda (B0) y sube de nivel.
   - EMPATE (cero): termina la señal, sin cambio de bankroll.
   - Sin base de datos de pre-entrenamiento.
-  - WS Key: 203
-  - Consulta de datos cada 1s para alta velocidad
+  - WS Key: 203 | Consulta cada 1s
 """
 
 import asyncio
@@ -39,12 +38,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [SpeedDC] %(levelname)s %(message)s')
-logger = logging.getLogger("SpeedDC")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [Speed1DC] %(levelname)s %(message)s')
+logger = logging.getLogger("Speed1DC")
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
-# ─── TELEGRAM — SPEED ROULETTE ────────────────────────────────────────────────
+# ─── TELEGRAM — SPEED ROULETTE 1 ─────────────────────────────────────────────
 TOKEN   = "8615799238:AAG2kLg-Ostc4Y4E98HXDIoje_U4F7oqdzU"
 CHAT_ID = -1003821352139
 
@@ -60,7 +59,7 @@ bot.session = _session
 WS_URL      = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID   = "ppcjd00000007254"
 WS_KEY      = 203
-LIVE_DB     = "speed_live.db"
+LIVE_DB     = "speed1_live.db"
 
 BASE_BET       = 0.50
 MAX_NIVEL      = 6
@@ -224,7 +223,7 @@ class OnlineEnsemblePredictor:
             return {c + 1: float(p) for c, p in enumerate(final)}
         except: return None
 
-# ─── GESTOR DOCENAS (CON GESTIÓN DE DEUDAS INTERNA) ──────────────────────────
+# ─── GESTOR DOCENAS (GESTIÓN X3 CONSERVADORA) ────────────────────────────────
 class GestorDocenas:
     def __init__(self):
         self.nivel = 1
@@ -246,12 +245,7 @@ class GestorDocenas:
         if self.oportunidad == 1:
             return self.nivel * BASE_BET
         else:
-            target = self.get_target()
-            deficit = target - balance_actual
-            if deficit <= 0:
-                return BASE_BET
-            apuesta = max(BASE_BET, math.ceil(deficit / BASE_BET) * BASE_BET)
-            return apuesta
+            return 3 * self.nivel * BASE_BET
 
     def registrar_perdida_senal(self):
         self.debt_stack.append(self.b0)
@@ -259,7 +253,7 @@ class GestorDocenas:
             self.nivel += 1
         else:
             self.nivel = 1
-        logger.info(f"[SpeedDC] 📋 Deuda registrada: B0={self.b0:.2f} | Pila: {len(self.debt_stack)} deudas | Nivel→{self.nivel}")
+        logger.info(f"[Speed1DC] 📋 Deuda registrada: B0={self.b0:.2f} | Pila: {len(self.debt_stack)} deudas | Nivel→{self.nivel}")
 
     def verificar_recuperacion(self, balance_actual: float):
         while self.debt_stack:
@@ -299,7 +293,6 @@ class DetailedStats:
 
     def get_stats_text(self, bankroll: float) -> str:
         total = self.wins + self.zeros + self.losses
-        # Los empates (zeros) cuentan como aciertos para la Assertividade
         eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
         text  = "📊 RESUMEN DE SEÑALES 📊\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
@@ -320,7 +313,7 @@ class DetailedStats:
         return text
 
 # ─── ENGINE ───────────────────────────────────────────────────────────────────
-class SpeedRouletteEngine:
+class Speed1RouletteEngine:
     def __init__(self):
         self.spin_history: list = []
         self.dozen_seq: list = []; self.column_seq: list = []
@@ -349,7 +342,7 @@ class SpeedRouletteEngine:
         total = live_loaded
         self.ws_count = total
         self.warmup_done = total >= WARMUP_SPINS
-        logger.info(f"[SpeedDC] 📦 Pre-cargados: {total} (Live) | Warmup: {'✅' if self.warmup_done else '⏳'}")
+        logger.info(f"[Speed1DC] 📦 Pre-cargados: {total} (Live) | Warmup: {'✅' if self.warmup_done else '⏳'}")
 
     def _load_live_history(self) -> int:
         try: rows = self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
@@ -396,7 +389,7 @@ class SpeedRouletteEngine:
             self.spins_since_train += 1
             if self.spins_since_train >= TRAIN_INTERVAL:
                 self._train_models(); self.spins_since_train = 0
-                logger.info("[SpeedDC] 🧠 Modelos re-entrenados (c/100 giros)")
+                logger.info("[Speed1DC] 🧠 Modelos re-entrenados (c/100 giros)")
         if persist: self._persist(number)
 
     def _get_pf(self, cat_type: str) -> Optional[Dict]:
@@ -453,14 +446,14 @@ class SpeedRouletteEngine:
             base = 0.65 * pf_d["prob"] + 0.35 * ph_d["prob"]
             ml   = self._predict_pair_ml("DOCENA", pf_d["missing"])
             prob = 0.5 * base + 0.5 * ml
-            logger.info(f"[SpeedDC] D base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
+            logger.info(f"[Speed1DC] D base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
             if prob >= MIN_PROB:
                 candidates.append({"type":"DOCENA","pair":tuple(f"D{x}" for x in sorted(pf_d["pair"])),"missing":f"D{pf_d['missing']}","prob":prob})
         if pf_c and ph_c and set(pf_c["pair"]) == set(ph_c["pair"]):
             base = 0.65 * pf_c["prob"] + 0.35 * ph_c["prob"]
             ml   = self._predict_pair_ml("COLUMNA", pf_c["missing"])
             prob = 0.5 * base + 0.5 * ml
-            logger.info(f"[SpeedDC] C base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
+            logger.info(f"[Speed1DC] C base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
             if prob >= MIN_PROB:
                 candidates.append({"type":"COLUMNA","pair":tuple(f"C{x}" for x in sorted(pf_c["pair"])),"missing":f"C{pf_c['missing']}","prob":prob})
         return max(candidates, key=lambda x: x["prob"]) if candidates else None
@@ -470,8 +463,8 @@ class SpeedRouletteEngine:
         nums = sorted([p[1:] for p in self.active_pair])
         pair_disp = f"{nums[0]} y {nums[1]}"
         type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
-        return (f"✅ ENTRADA CONFIRMADA ✅\n\n"
-                f"🕹️ Roulette Speed\n"
+        return (f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
+                f"🕹️ Roulette Speed 1\n"
                 f"🎯 Entrar en las {type_str}: {pair_disp}\n"
                 f"💰 Balance: {self.bankroll:.2f}\n"
                 f"💵 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
@@ -510,7 +503,7 @@ class SpeedRouletteEngine:
             tg_send(f"✅ WIN {number} — {type_str} {val_num} — 🔄 GALE #{gale_num}\n"
                     f"🎉 Felicidades has ganado {profit:.2f} 🎉\n"
                     f"💰 Balance actual: {self.bankroll:.2f}")
-
+            
             self.stats.record('WIN', gale_num, number, val_num, type_str, self.bankroll)
             self._check_stats()
             self._reset_signal()
@@ -530,10 +523,10 @@ class SpeedRouletteEngine:
                 tg_send(f"❌ LOSS {number} — {type_str} {val_num} — 🔄 GALE #1\n"
                         f"🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n"
                         f"💰 Balance actual: {self.bankroll:.2f}")
-
-                self.stats.record('LOSS', 1, number, val_num, type_str, self.bankroll)
+                
+                self.stats.record('LOSS', 1, number, val_num, type_str, self.bankroll) 
                 self.gestor.registrar_perdida_senal()
-
+                    
                 self._check_stats()
                 self._reset_signal()
 
@@ -556,14 +549,14 @@ class SpeedRouletteEngine:
     def _process_inner(self, number: int):
         color = REAL_COLOR_MAP.get(number, "VERDE")
         d = get_dozen(number); c = get_column(number)
-        logger.info(f"[SpeedDC] 🎰 #{len(self.spin_history)+1}: {number} {color} D{d} C{c}")
+        logger.info(f"[Speed1DC] 🎰 #{len(self.spin_history)+1}: {number} {color} D{d} C{c}")
         self._update_state(number)
         if not self.warmup_done:
             self.ws_count += 1
             if self.ws_count < WARMUP_SPINS: return
             self.warmup_done = True
-            tg_send("🟢 <b>Speed Roulette DC</b> — Sistema PF+PH+ML Listo.")
-            logger.info("[SpeedDC] ✅ WARMUP COMPLETADO")
+            tg_send("🟢 <b>Speed Roulette 1 DC</b> — Sistema PF+PH+ML Listo.")
+            logger.info("[Speed1DC] ✅ WARMUP COMPLETADO")
         if self.signal_active:
             self._resolve(number, color)
         else:
@@ -574,28 +567,22 @@ class SpeedRouletteEngine:
                 self.gestor.iniciar_senal(self.bankroll)
                 self.total_signal_loss = 0.0
                 self._send_signal()
-                logger.info(f"[SpeedDC] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
+                logger.info(f"[Speed1DC] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
 
     # ─── WebSocket Alta Velocidad (1s timeout) ────────────────────────────────
     async def run_ws(self):
         reconnect_delay = 5
         while True:
             try:
-                # Reducido ping a 5s para mantener la conexión muy activa en Speed Roulette
                 async with websockets.connect(WS_URL, ping_interval=5, ping_timeout=10, close_timeout=10) as ws:
                     await ws.send(json.dumps({"type": "subscribe", "key": WS_KEY, "casinoId": CASINO_ID}))
-                    logger.info(f"[SpeedDC] ✅ WS conectado — Speed Roulette key={WS_KEY}")
+                    logger.info(f"[Speed1DC] ✅ WS conectado — Speed Roulette 1 key={WS_KEY}")
                     reconnect_delay = 5
-                    
-                    # Bucle activo con timeout de 1 segundo para consultar datos constantemente
                     while True:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                            try: 
-                                data = json.loads(raw)
-                            except: 
-                                continue
-                                
+                            try: data = json.loads(raw)
+                            except: continue
                             if not isinstance(data, dict): continue
                             results = data.get("last20Results")
                             if results and isinstance(results, list):
@@ -607,7 +594,6 @@ class SpeedRouletteEngine:
                                 except: continue
                                 if 0 <= n <= 36: self.process_number(n)
                                 continue
-                                
                             for key in ("result", "number", "outcome", "winningNumber"):
                                 if key in data:
                                     try:
@@ -615,23 +601,19 @@ class SpeedRouletteEngine:
                                         if 0 <= n <= 36: self.process_number(n)
                                     except: pass
                                     break
-                                    
                         except asyncio.TimeoutError:
-                            # Se ejecuta cada 1 segundo si no hay datos, permite mantener 
-                            # el botón de consulta presionado y procesar tareas en segundo plano
                             continue
-                            
             except Exception as e:
-                logger.warning(f"[SpeedDC] WS desconectado: {e}. Recon en {reconnect_delay}s")
+                logger.warning(f"[Speed1DC] WS desconectado: {e}. Recon en {reconnect_delay}s")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
 
 # ─── FLASK ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-engine: Optional[SpeedRouletteEngine] = None
+engine: Optional[Speed1RouletteEngine] = None
 
 @app.route("/")
-def home(): return jsonify({"status": "ok", "bot": "Speed DC", "key": WS_KEY})
+def home(): return jsonify({"status": "ok", "bot": "Speed 1 DC", "key": WS_KEY})
 @app.route("/ping")
 def ping(): return jsonify({"status": "pong", "ts": time.time()})
 @app.route("/health")
@@ -647,7 +629,7 @@ async def self_ping_loop():
         await asyncio.sleep(240)
 
 @bot.message_handler(commands=['start', 'help'])
-def cmd_start(m): bot.reply_to(m, "<b>🎰 Speed Roulette DC</b>\n\nApuesta: 0.50 por D/C\nCapital: 0\nKey WS: 203\n\n/status /stats /reset", parse_mode="HTML")
+def cmd_start(m): bot.reply_to(m, "<b>🎰 Speed Roulette 1 DC</b>\n\nApuesta: 0.50 por D/C\nCapital: 0\nKey WS: 203\n\n/status /stats /reset", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(m):
@@ -670,9 +652,9 @@ def run_flask():
 
 async def main():
     global engine
-    engine = SpeedRouletteEngine()
+    engine = Speed1RouletteEngine()
     threading.Thread(target=lambda: bot.polling(none_stop=True, interval=1, timeout=30), daemon=True).start()
-    logger.info("[SpeedDC] 🎰 Bot Speed iniciado — key=203 (Modo Alta Velocidad 1s)")
+    logger.info("[Speed1DC] 🎰 Bot Speed 1 iniciado — key=203 (Alta Velocidad)")
     await asyncio.gather(asyncio.create_task(engine.run_ws()), asyncio.create_task(self_ping_loop()))
 
 if __name__ == "__main__":
