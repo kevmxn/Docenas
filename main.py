@@ -36,7 +36,8 @@ for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 TOKEN   = "8615799238:AAG2kLg-Ostc4Y4E98HXDIoje_U4F7oqdzU"
-CHAT_ID = -1003821352139
+CHAT_ID = -1003821352139  # Nuevo chat_id
+STATS_THREAD_ID = 40034
 
 _session = requests.Session()
 _retry = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
@@ -687,31 +688,23 @@ class SessionManager:
         next_idx = (self.current_idx + 1) % len(self.engines)
         next_name = self.engines[next_idx].name
 
-        result_labels = {
-            "WIN":    "✅ Señal ganada",
-            "LOSS":   "❌ Señal perdida",
-            "EMPATE": "🟠 Empate (cero)",
-            "TIMEOUT": "⏰ Sin señal (tiempo agotado)",
-        }
-        result_text = result_labels.get(self.last_result, self.last_result)
-
-        if self.prev_end_msg_id:
-            tg_delete(CHAT_ID, self.prev_end_msg_id)
-            self.prev_end_msg_id = None
-
+        # ── Nuevo formato de mensaje ──────────────────────────────────────
         msg_id = tg_send(
             f"⏸ SESIÓN CERRADA — {engine.name}\n"
-            f"{result_text}\n\n"
             f"🎰 PRÓXIMA RULETA — {next_name} 🎰\n\n"
             f"💵 ¿COMO OPERAR LAS SEÑALES?\n\n"
             f"1° Op. = $0.50 USD x Docena/Columna\n"
             f"2° Op. = $1.50 USD x Docena/Columna\n\n"
-            f"🔄 Ciclo: Señal → 2 min → Cierre → 5 min → Nueva sesión\n"
-            f"♦️ POR SESION SE ENVIA 1 SEÑAL"
+            f"🎯 FUNCIONAMIENTO DE LAS SEÑALES 🎯\n\n"
+            f"  • Se envía señal → Se resuelve\n"
+            f"  • Sesión se cierra → 2 minutos \n"
+            f"  • Nueva Sesión → 5 minutos\n"
+            f"  • Nueva Señal → Ciclo de señales\n\n"
+            f"♦️ POR SESION SE ENVÍA 1 SEÑAL ♦️"
         )
         self.prev_end_msg_id = msg_id
         self.state = self.STATE_SESSION_CLOSED
-        logger.info(f"[Session] ⏸ Sesión cerrada: {engine.name} | Resultado: {self.last_result}")
+        logger.info(f"[Session] ⏸ Sesión cerrada: {engine.name}")
 
     async def session_loop(self):
         """Bucle principal: ejecuta sesiones infinitamente."""
