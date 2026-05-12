@@ -676,9 +676,13 @@ class SessionManager:
         self.state = self.STATE_WAITING_SIGNAL
         engine = self.engines[self.current_idx]
 
+        # ── Borrar mensajes anteriores de inicio y fin ────────────────────
         if self.prev_start_msg_id:
             tg_delete(CHAT_ID, self.prev_start_msg_id)
             self.prev_start_msg_id = None
+        if self.prev_end_msg_id:
+            tg_delete(CHAT_ID, self.prev_end_msg_id)
+            self.prev_end_msg_id = None
 
         msg_id = tg_send(f"🔔 SESIÓN INICIADA — {engine.name} 🔔")
         self.prev_start_msg_id = msg_id
