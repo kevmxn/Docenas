@@ -539,7 +539,7 @@ class RouletteEngine:
         self.oportunidad = 1
         self.total_signal_loss = 0.0
         self.last_result_type = None
-        self.skip_next_spin = True
+        self.skip_next_spin = True   # ignorar el giro que activó la señal, validar desde el siguiente
         self.send_signal()
 
     def resolve(self, number: int) -> bool:
@@ -584,11 +584,12 @@ class RouletteEngine:
             self.total_signal_loss = round(self.total_signal_loss + loss, 2)
 
             if intento == 1:
+                # ── Perdió Gale #0 → borrar mensaje, enviar GALE #1 ────────
+                # El próximo giro valida Gale #1 directamente (NO se salta)
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
                 self.oportunidad = 2
-                self.skip_next_spin = True
                 self.send_signal()
                 return False
             else:
@@ -688,7 +689,6 @@ class SessionManager:
         next_idx = (self.current_idx + 1) % len(self.engines)
         next_name = self.engines[next_idx].name
 
-        # ── Nuevo formato de mensaje ──────────────────────────────────────
         msg_id = tg_send(
             f"⏸ SESIÓN CERRADA — {engine.name}\n"
             f"🎰 PRÓXIMA RULETA — {next_name} 🎰\n\n"
