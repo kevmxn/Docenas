@@ -1,14 +1,24 @@
+
 #!/usr/bin/env python3
 """
-Multi-Roulette Session Bot — 12 Ruletas / Sesiones de 30 min / Hasta 3 señales por sesión
+Speed Roulette 2 — Bot de señales para Docenas y Columnas
+Sistema PF + PH + ML Cruzado + Gestión Docenas (6 niveles, 2 oportunidades)
++ Sesiones de 30 min + WebSocket Server para HTML + Gestión del Cero (10%)
 
-Lógica:
-  - Cada sesión dura 30 min (slot de tiempo fijo: HH:00 y HH:30, hora Argentina UTC-3).
-  - Las 12 ruletas se rotan en orden secuencial. Al terminar la 12ª vuelve a la 1ª.
-  - Cada sesión emite como máximo 3 señales (puede ser 1, 2 o 3).
-  - Una vez resuelta una señal, si quedan más de 5 min puede detectar una nueva.
-  - Al terminar los 25 min activos se cierra la sesión (pausa 5 min).
-  - Apuesta: $0.50 por categoría (total $1.00). En gale x3 → $1.50 c/u (total $3.00). Solo 1 gale.
+  - Capital inicial: 0
+  - Apuesta base: 0.50 por docena/columna
+  - Apuesta al Cero: 10% de la ficha (0.05 en nivel 1). No se indica en la señal.
+  - Si sale Cero: Paga 36x la ficha del cero. Se restan las apuestas de D/C y Cero 
+    de ambos intentos (Gale 0 y Gale 1) para dar el neto de la señal.
+  - Si se gana D/C: Paga 3x la ficha. Se resta la apuesta del Cero a la ganancia neta.
+  - Gestión: 6 niveles con 2 oportunidades (Gale #0 y Gale #1) por señal.
+      · Gale #0 → apuesta = nivel × BASE_BET
+      · Gale #1 → apuesta = 3 × (nivel × BASE_BET)  [Gestión conservadora x3]
+  - Si se pierde Gale #1: registra deuda (B0) y sube de nivel.
+  - EMPATE (cero): termina la señal, con cálculo de ganancia/pérdida correspondiente.
+  - Sesiones: 25 min activos + 5 min pausa = 30 min ciclo
+  - Máx 3 señales por sesión
+  - WebSocket server en puerto 8765 para HTML externo
 """
 
 import asyncio
@@ -20,7 +30,7 @@ import threading
 import time
 import urllib.request
 from collections import deque, defaultdict
-from typing import Optional, Dict
+from typing import Optional, Dict, Set
 
 import numpy as np
 from sklearn.naive_bayes import MultinomialNB
@@ -35,8 +45,8 @@ from urllib3.util.retry import Retry
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s [MainRoulette] %(levelname)s %(message)s')
-logger = logging.getLogger("MainRoulette")
+                    format='%(asctime)s [Speed2DC] %(levelname)s %(message)s')
+logger = logging.getLogger("Speed2DC")
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
@@ -53,36 +63,13 @@ _session.mount("http://",  HTTPAdapter(max_retries=_retry, pool_connections=10, 
 bot = telebot.TeleBot(TOKEN, threaded=False)
 bot.session = _session
 
-# ─── RULETAS CONFIGURACIÓN ────────────────────────────────────────────────────
+# ─── RULETA CONFIGURACIÓN ────────────────────────────────────────────────────
 ROULETTES = [
-    {"key": 221, "name": "ROULETTE RUSSIAN"},
-    {"key": 224, "name": "ROULETTE TURKISH"},
-    {"key": 201, "name": "ROULETTE 2 EXTRA TIME"},
-    {"key": 234, "name": "ROULETTE LATINA"},
-    {"key": 225, "name": "AUTO ROULETTE"},
-    {"key": 204, "name": "MEGA ROULETTE"},
-    {"key": 206, "name": "ROULETTE MACAO"},
-    {"key": 223, "name": "ROULETTE ITALIA"},
-    {"key": 222, "name": "ROULETTE ALEMANA"},
-    {"key": 227, "name": "ROULETTE 1"},
-    {"key": 203, "name": "SPEED ROULETTE 1"},
     {"key": 205, "name": "SPEED ROULETTE 2"},
 ]
 
-# ─── LINKS POR RULETA ─────────────────────────────────────────────────────────
 ROULETTE_LINKS = {
-    "MEGA ROULETTE":         "https://1win.lat/casino/play/v_pragmatic:megaroulette",
-    "AUTO ROULETTE":         "https://1win.lat/casino/play/v_pragmatic:1winautoroulette",
-    "ROULETTE ITALIA":       "https://1win.lat/casino/play/v_pragmatic:rouletteitaliatricolore",
-    "ROULETTE 1":            "https://1win.lat/casino/play/v_pragmatic:roulette1",
-    "ROULETTE 2 EXTRA TIME": "https://1win.lat/casino/play/v_pragmatic:roulette2",
-    "SPEED ROULETTE 1":      "https://1win.lat/casino/play/v_pragmatic:speedroulette1",
-    "SPEED ROULETTE 2":      "https://1win.lat/casino/play/v_pragmatic:speedroulette2",
-    "ROULETTE MACAO":        "https://1win.lat/casino/play/v_pragmatic:roulettemacao",
-    "ROULETTE LATINA":       "https://1win.lat/casino/play/v_pragmatic:1winspanishroulette",
-    "ROULETTE ALEMANA":      "https://1win.lat/casino/play/v_pragmatic:germanroulette",
-    "ROULETTE TURKISH":      "https://1win.lat/casino/play/v_pragmatic:1winturkishroulette",
-    "ROULETTE RUSSIAN":      "https://1win.lat/casino/play/v_pragmatic:1winroulette",
+    "SPEED ROULETTE 2": "https://1win.lat/casino/play/v_pragmatic:speedroulette2",
 }
 
 def get_roulette_url(name: str) -> Optional[str]:
@@ -110,11 +97,14 @@ SESSION_ACTIVE      = 25 * 60
 SESSION_PAUSE       = 5  * 60
 SESSION_TOTAL       = SESSION_ACTIVE + SESSION_PAUSE
 BASE_BET            = 0.50
+MAX_NIVEL           = 6
 WARMUP_SPINS        = 25
 MIN_PROB            = 0.78
 TRAIN_INTERVAL      = 100
 MAX_SIGNALS         = 3
 SIGNAL_WAIT_TIMEOUT = 120
+
+WS_SERVER_PORT = int(os.environ.get("WS_SERVER_PORT", 8765))
 
 REAL_COLOR_MAP: dict = {
     0:"VERDE",1:"ROJO",2:"NEGRO",3:"ROJO",4:"NEGRO",5:"ROJO",6:"NEGRO",
@@ -132,6 +122,14 @@ def get_dozen(n: int) -> int:
 def get_column(n: int) -> int:
     if n == 0: return 0
     return ((n - 1) % 3) + 1
+
+# ─── COLA DE BROADCAST PARA HTML ──────────────────────────────────────────────
+_ws_clients: Set[asyncio.Queue] = set()
+
+def queue_broadcast(data: dict):
+    for q in list(_ws_clients):
+        try: q.put_nowait(data)
+        except: pass
 
 # ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 _TG_RETRIES = 12
@@ -275,6 +273,56 @@ class OnlineEnsemblePredictor:
             return {c + 1: float(p) for c, p in enumerate(final)}
         except: return None
 
+# ─── GESTOR DOCENAS (6 NIVELES, 2 OPORTUNIDADES, PILA DE DEUDAS) ─────────────
+class GestorDocenas:
+    """
+    Gestión conservadora x3 con 6 niveles y pila de deudas.
+    El target de recuperación se ajusta restando el 10% de la ficha (apuesta al cero).
+    """
+    def __init__(self):
+        self.nivel = 1
+        self.oportunidad = 1
+        self.max_nivel = MAX_NIVEL
+        self.b0 = 0.0
+        self.debt_stack: list[float] = []
+
+    def iniciar_senal(self, balance_actual: float):
+        self.b0 = balance_actual
+        self.oportunidad = 1
+
+    def get_target(self) -> float:
+        net_base = BASE_BET * 0.9  # Ganancia neta de un gale0 al descontar la ficha del cero
+        if self.debt_stack:
+            return self.debt_stack[-1] + net_base
+        return self.b0 + net_base
+
+    def apostar_por_docena(self, balance_actual: float) -> float:
+        if self.oportunidad == 1:
+            return self.nivel * BASE_BET
+        else:
+            return 3 * self.nivel * BASE_BET
+
+    def registrar_perdida_senal(self):
+        self.debt_stack.append(self.b0)
+        if self.nivel < self.max_nivel:
+            self.nivel += 1
+        else:
+            self.nivel = 1
+        logger.info(f"[Gestor] 📋 Deuda registrada: B0={self.b0:.2f} | "
+                     f"Pila: {len(self.debt_stack)} deudas | Nivel→{self.nivel}")
+
+    def verificar_recuperacion(self, balance_actual: float):
+        while self.debt_stack:
+            target = self.get_target()
+            if balance_actual >= target:
+                self.debt_stack.pop()
+                logger.info(f"[Gestor] ✅ Deuda recuperada | Pila restante: {len(self.debt_stack)}")
+            else:
+                break
+        if not self.debt_stack:
+            self.nivel = 1
+            logger.info("[Gestor] 🏆 Sin deudas — Nivel reseteado a 1")
+
 # ─── STATS GLOBAL ─────────────────────────────────────────────────────────────
 class GlobalStats:
     def __init__(self):
@@ -283,11 +331,11 @@ class GlobalStats:
         self.last_20 = deque(maxlen=20)
         self.signals_processed = 0
         self.global_bankroll: float = 0.0
+        self.last_report_signals = 0
 
     def record(self, result_type: str, attempt: int, number: int,
-               val, type_str: str, roulette_name: str, profit_or_loss: float):
+               val, type_str: str, roulette_name: str):
         self.signals_processed += 1
-        self.global_bankroll = round(self.global_bankroll + profit_or_loss, 2)
         if result_type == 'WIN':
             self.wins += 1; self.consecutive += 1
         elif result_type == 'LOSS':
@@ -300,10 +348,16 @@ class GlobalStats:
             "roulette": roulette_name, "balance": self.global_bankroll
         })
 
+    def should_send(self) -> bool:
+        return (self.signals_processed - self.last_report_signals) >= 20
+
+    def mark_sent(self):
+        self.last_report_signals = self.signals_processed
+
     def get_stats_text(self) -> str:
         total = self.wins + self.zeros + self.losses
         eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
-        text  = "📊 RESUMEN DIARIO — TODAS LAS RULETAS 📊\n"
+        text  = "📊 RESUMEN DIARIO — SPEED ROULETTE 2 📊\n"
         text += "🕛 Reporte 12:00 hs (Argentina)\n\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
@@ -325,7 +379,7 @@ class GlobalStats:
 
 GLOBAL_STATS = GlobalStats()
 
-# ─── ENGINE POR RULETA ────────────────────────────────────────────────────────
+# ─── ENGINE ───────────────────────────────────────────────────────────────────
 class RouletteEngine:
 
     def __init__(self, ws_key: int, name: str):
@@ -348,8 +402,9 @@ class RouletteEngine:
         self.active_type       = None
         self.active_pair: tuple = ()
         self.active_missing    = ""
+        self._last_signal_prob = 0.0
+        self.gestor            = GestorDocenas()
         self.total_signal_loss = 0.0
-        self.oportunidad       = 1
         self.bankroll: float   = 0.0
         self.active_signal_msg_id = None
         self.spins_since_train = 0
@@ -421,6 +476,7 @@ class RouletteEngine:
             self.spins_since_train += 1
             if self.spins_since_train >= TRAIN_INTERVAL:
                 self._train_models(); self.spins_since_train = 0
+                logger.info(f"[{self.name}] 🧠 Modelos re-entrenados (c/{TRAIN_INTERVAL} giros)")
         if persist: self._persist(number)
 
     def _get_pf(self, cat_type: str) -> Optional[Dict]:
@@ -482,6 +538,7 @@ class RouletteEngine:
             base = 0.65 * pf_d["prob"] + 0.35 * ph_d["prob"]
             ml   = self._predict_pair_ml("DOCENA", pf_d["missing"])
             prob = 0.5 * base + 0.5 * ml
+            logger.info(f"[{self.name}] D base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
             if prob >= MIN_PROB:
                 candidates.append({"type": "DOCENA",
                                    "pair": tuple(f"D{x}" for x in sorted(pf_d["pair"])),
@@ -490,19 +547,21 @@ class RouletteEngine:
             base = 0.65 * pf_c["prob"] + 0.35 * ph_c["prob"]
             ml   = self._predict_pair_ml("COLUMNA", pf_c["missing"])
             prob = 0.5 * base + 0.5 * ml
+            logger.info(f"[{self.name}] C base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
             if prob >= MIN_PROB:
                 candidates.append({"type": "COLUMNA",
                                    "pair": tuple(f"C{x}" for x in sorted(pf_c["pair"])),
                                    "missing": f"C{pf_c['missing']}", "prob": prob})
         return max(candidates, key=lambda x: x["prob"]) if candidates else None
 
+    # ── FORMATO ORIGINAL DE SEÑAL (Sin monto del cero indicado) ──────────────
     def _build_signal_text(self) -> str:
         nums = sorted([p[1:] for p in self.active_pair])
         pair_disp = f"{nums[0]} y {nums[1]}"
         type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" \
                              else ("columnas", "columna")
-        gale_num  = self.oportunidad - 1
-        bet       = BASE_BET if gale_num == 0 else BASE_BET * 3
+        gale_num  = self.gestor.oportunidad - 1
+        bet       = self.gestor.apostar_por_docena(self.bankroll)
         total_bet = bet * 2
         return (
             f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
@@ -519,31 +578,80 @@ class RouletteEngine:
         msg_id = tg_send(self._build_signal_text())
         if msg_id:
             self.active_signal_msg_id = msg_id
+        # ── BROADCAST SEÑAL A HTML ──
+        gale_num = self.gestor.oportunidad - 1
+        bet = self.gestor.apostar_por_docena(self.bankroll)
+        nums = sorted([p[1:] for p in self.active_pair])
+        queue_broadcast({
+            "type": "signal",
+            "roulette": self.name,
+            "signal_type": self.active_type,
+            "pair": list(self.active_pair),
+            "pair_nums": nums,
+            "missing": self.active_missing,
+            "prob": round(self._last_signal_prob, 4),
+            "attempt": self.gestor.oportunidad,
+            "gale": gale_num,
+            "bet_per_cat": bet,
+            "total_bet": bet * 2,
+            "balance": GLOBAL_STATS.global_bankroll,
+            "nivel": self.gestor.nivel,
+            "debt_count": len(self.gestor.debt_stack),
+        })
 
     def iniciar_senal(self, sig: dict):
         self.signal_active     = True
         self.active_type       = sig["type"]
         self.active_pair       = sig["pair"]
         self.active_missing    = sig["missing"]
-        self.oportunidad       = 1
+        self._last_signal_prob = sig.get("prob", 0)
+        self.gestor.iniciar_senal(self.bankroll)
         self.total_signal_loss = 0.0
         self.send_signal()
+        logger.info(f"[{self.name}] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
 
+    # ── RESOLUCIÓN CON GESTOR DOCENAS + CÁLCULO DEL CERO (10%) ───────────────
     def resolve(self, number: int) -> bool:
         d, c     = get_dozen(number), get_column(number)
         type_str = self.active_type
         val_num  = d if type_str == "DOCENA" else c
-        intento  = self.oportunidad
-        bet      = BASE_BET if intento == 1 else BASE_BET * 3
-        gale_num = intento - 1
+        gale_num = self.gestor.oportunidad - 1
+        bet      = self.gestor.apostar_por_docena(self.bankroll)
+        
+        zero_bet = round(0.1 * bet, 2)
+        spin_investment = round((2 * bet) + zero_bet, 2)
 
+        # ── CERO (EMPATE) ──
         if number == 0:
-            GLOBAL_STATS.record('EMPATE', intento, 0, 0, type_str, self.name, 0.0)
+            zero_payout = round(zero_bet * 36, 2)
+            spin_profit = round(zero_payout - spin_investment, 2)
+            self.bankroll = round(self.bankroll + spin_profit, 2)
+            signal_profit = round(spin_profit - self.total_signal_loss, 2)
+            
+            self.gestor.verificar_recuperacion(self.bankroll)
+            GLOBAL_STATS.global_bankroll = self.bankroll
+            
+            GLOBAL_STATS.record('EMPATE', self.gestor.oportunidad, 0, 0, type_str, self.name)
             tg_send(
                 f"🟠 EMPATE 0 — ZERO — 🔄 GALE #{gale_num}\n"
-                f"🉑 Para la próxima ganaremos 0.00 🉑\n"
+                f"🉑 Para la próxima ganaremos {signal_profit:.2f} 🉑\n"
                 f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
             )
+            queue_broadcast({
+                "type": "result",
+                "result": "EMPATE",
+                "number": 0, "color": "VERDE",
+                "dozen": 0, "column": 0,
+                "detail": "ZERO",
+                "attempt": self.gestor.oportunidad,
+                "gale": gale_num,
+                "profit": signal_profit,
+                "balance": GLOBAL_STATS.global_bankroll,
+                "total_loss": 0.0,
+                "nivel": self.gestor.nivel,
+                "debt_count": len(self.gestor.debt_stack),
+            })
+            self._check_stats()
             self._reset_signal()
             return True
 
@@ -551,52 +659,106 @@ class RouletteEngine:
               (type_str == "COLUMNA" and c != 0 and f"C{c}" in self.active_pair)
 
         if won:
-            profit = bet
+            # ── WIN (D/C) ── Ganancia D/C menos la apuesta del cero perdida
+            dozen_payout = round(3 * bet, 2)
+            spin_profit = round(dozen_payout - spin_investment, 2) # bet - zero_bet
+            self.bankroll = round(self.bankroll + spin_profit, 2)
+            signal_profit = round(spin_profit - self.total_signal_loss, 2)
+            
+            self.gestor.verificar_recuperacion(self.bankroll)
+            GLOBAL_STATS.global_bankroll = self.bankroll
+
             cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
-            GLOBAL_STATS.record('WIN', intento, number, val_num, type_str, self.name, profit)
+            GLOBAL_STATS.record('WIN', self.gestor.oportunidad, number, val_num, type_str, self.name)
             tg_send(
                 f"✅ WIN {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
-                f"🎉 Felicidades has ganado {profit:.2f} 🎉\n"
+                f"🎉 Felicidades has ganado {signal_profit:.2f} 🎉\n"
                 f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
             )
+            queue_broadcast({
+                "type": "result",
+                "result": "WIN",
+                "number": number, "color": REAL_COLOR_MAP.get(number, "VERDE"),
+                "dozen": d, "column": c,
+                "detail": cat_label,
+                "attempt": self.gestor.oportunidad,
+                "gale": gale_num,
+                "profit": signal_profit,
+                "balance": GLOBAL_STATS.global_bankroll,
+                "total_loss": 0.0,
+                "nivel": self.gestor.nivel,
+                "debt_count": len(self.gestor.debt_stack),
+            })
+            self._check_stats()
             self._reset_signal()
             return True
 
         else:
-            loss = bet * 2
-            self.bankroll          = round(self.bankroll - loss, 2)
-            self.total_signal_loss = round(self.total_signal_loss + loss, 2)
+            # ── LOSS (D/C incorrecta) ── Se resta la inversión de D/C + Cero
+            self.bankroll = round(self.bankroll - spin_investment, 2)
+            self.total_signal_loss = round(self.total_signal_loss + spin_investment, 2)
+            GLOBAL_STATS.global_bankroll = self.bankroll
 
-            if intento == 1:
+            if gale_num == 0:
+                # Ir a Gale #1
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
-                self.oportunidad = 2
+                self.gestor.oportunidad = 2
                 self.send_signal()
                 return False
 
             else:
+                # Pérdida total de la señal → registrar deuda y subir nivel
                 cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
-                GLOBAL_STATS.record('LOSS', 2, number, val_num, type_str,
-                                    self.name, -self.total_signal_loss)
+                GLOBAL_STATS.record('LOSS', 2, number, val_num, type_str, self.name)
+                self.gestor.registrar_perdida_senal()
                 tg_send(
                     f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
                     f"🚨 Señal perdida. Monto total perdido en las 2 entradas: "
                     f"-{self.total_signal_loss:.2f} 🚨\n"
                     f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
                 )
+                queue_broadcast({
+                    "type": "result",
+                    "result": "LOSS",
+                    "number": number, "color": REAL_COLOR_MAP.get(number, "VERDE"),
+                    "dozen": d, "column": c,
+                    "detail": cat_label,
+                    "attempt": 2,
+                    "gale": gale_num,
+                    "profit": -self.total_signal_loss,
+                    "balance": GLOBAL_STATS.global_bankroll,
+                    "total_loss": self.total_signal_loss,
+                    "nivel": self.gestor.nivel,
+                    "debt_count": len(self.gestor.debt_stack),
+                })
+                self._check_stats()
                 self._reset_signal()
                 return True
+
+    def _check_stats(self):
+        if not GLOBAL_STATS.should_send(): return
+        tg_send(GLOBAL_STATS.get_stats_text())
+        GLOBAL_STATS.mark_sent()
 
     def _reset_signal(self):
         self.signal_active     = False
         self.active_pair       = ()
         self.active_type       = None
         self.total_signal_loss = 0.0
-        self.oportunidad       = 1
         self.active_signal_msg_id = None
+        self._last_signal_prob = 0.0
 
+    # ── FEED NUMBER (con try/except de seguridad) ─────────────────────────────
     def feed_number(self, number: int, active: bool = False):
+        try:
+            self._feed_inner(number, active)
+        except Exception as e:
+            logger.error(f"[{self.name}] Error en feed_number: {e}", exc_info=True)
+            self._reset_signal()
+
+    def _feed_inner(self, number: int, active: bool = False):
         color  = REAL_COLOR_MAP.get(number, "VERDE")
         d      = get_dozen(number)
         c      = get_column(number)
@@ -611,26 +773,18 @@ class RouletteEngine:
             if self.ws_count >= WARMUP_SPINS:
                 self.warmup_done = True
                 warmup_tag = "✅ WARMUP listo"
+                tg_send("🟢 <b>Speed Roulette 2 DC</b> — Sistema PF+PH+ML Listo.")
         else:
             warmup_tag = "✔"
 
         logger.info(
             f"[{self.name}] 🎰 #{spin_n:>4} | {number:>2} {color:<5} D{d} C{c} "
-            f"| {tag} | {warmup_tag} | 💾 guardado"
+            f"| {tag} | {warmup_tag} | Nv{self.gestor.nivel} | 💰{self.bankroll:.2f}"
         )
 
 
 # ─── GESTOR DE SESIONES ───────────────────────────────────────────────────────
 class SessionManager:
-    """
-    Sesiones sincronizadas al reloj (hora Argentina, UTC-3):
-      - HH:00 y HH:30 exactos.
-      - 25 min activos + 5 min de pausa = ciclo de 30 min.
-      - 12 ruletas en orden secuencial.
-      - Hasta MAX_SIGNALS señales por sesión (se resetea a 0 en cada sesión).
-      - Borrado: al iniciar se borra el mensaje de inicio anterior.
-        El mensaje de fin se borra al enviar el SIGUIENTE mensaje de fin.
-    """
     ARG_UTC_OFFSET = -3
 
     def __init__(self):
@@ -645,7 +799,7 @@ class SessionManager:
         self.prev_start_msg_id: Optional[int] = None
         self.prev_end_msg_id:   Optional[int] = None
 
-        logger.info("[SessionManager] Iniciado — 12 ruletas / 30 min / máx 3 señales por sesión")
+        logger.info("[SessionManager] Iniciado — SPEED ROULETTE 2 / 30 min / máx 3 señales / 6 niveles")
 
     def _now_arg(self):
         import datetime
@@ -670,8 +824,6 @@ class SessionManager:
 
     def _start_session(self, initial: bool = False):
         import datetime
-        # Arranque inicial: sincronizar con el reloj.
-        # Rotaciones normales: avanzar secuencialmente.
         if initial:
             self.current_idx = self._slot_index_for_now()
         else:
@@ -694,6 +846,20 @@ class SessionManager:
 
         msg_id = tg_send(f"🔔 SESION INICIADA — {engine.name} 🔔")
         self.prev_start_msg_id = msg_id
+
+        # ── BROADCAST SESIÓN INICIADA A HTML ──
+        queue_broadcast({
+            "type": "session",
+            "status": "started",
+            "roulette": engine.name,
+            "next_roulette": engine.name,
+            "elapsed": 0,
+            "remaining": SESSION_ACTIVE,
+            "signals_count": 0,
+            "max_signals": MAX_SIGNALS,
+            "nivel": engine.gestor.nivel,
+            "debt_count": len(engine.gestor.debt_stack),
+        })
 
     def _end_session(self):
         engine    = self.engines[self.current_idx]
@@ -723,6 +889,20 @@ class SessionManager:
         )
         msg_id = tg_send_with_button(text, next_name)
         self.prev_end_msg_id = msg_id
+
+        # ── BROADCAST SESIÓN TERMINADA A HTML ──
+        queue_broadcast({
+            "type": "session",
+            "status": "ended",
+            "roulette": engine.name,
+            "next_roulette": next_name,
+            "elapsed": SESSION_ACTIVE,
+            "remaining": 0,
+            "signals_count": self.signals_this_session,
+            "max_signals": MAX_SIGNALS,
+            "nivel": engine.gestor.nivel,
+            "debt_count": len(engine.gestor.debt_stack),
+        })
 
     async def session_watchdog(self):
         wait = self.seconds_to_next_slot()
@@ -770,10 +950,10 @@ class SessionManager:
                     if pause_remaining > 0:
                         logger.info(f"[SessionManager] ⏸ Pausa {pause_remaining:.0f}s")
                         await asyncio.sleep(pause_remaining)
-                    self._start_session()    # rotación normal: avanza +1
+                    self._start_session()
             else:
                 if elapsed >= SESSION_TOTAL:
-                    self._start_session()    # rotación normal: avanza +1
+                    self._start_session()
 
     def tick_active(self, engine: RouletteEngine, number: int):
         engine.feed_number(number, active=True)
@@ -812,6 +992,29 @@ class SessionManager:
                 self.tick_active(engine, number)
             else:
                 self.tick_passive(engine, number)
+
+            # ── BROADCAST GIRO + ÚLTIMOS 20 A HTML ──
+            color = REAL_COLOR_MAP.get(number, "VERDE")
+            d = get_dozen(number)
+            c = get_column(number)
+            last20 = engine.spin_history[-20:]
+            queue_broadcast({
+                "type": "spin",
+                "number": number,
+                "color": color,
+                "dozen": d,
+                "column": c,
+                "spin_count": len(engine.spin_history),
+                "warmup_done": engine.warmup_done,
+                "last20": [{"number": s["number"], "color": s["color"],
+                            "dozen": get_dozen(s["number"]),
+                            "column": get_column(s["number"])}
+                           for s in last20],
+                "signal_active": engine.signal_active,
+                "balance": GLOBAL_STATS.global_bankroll,
+                "nivel": engine.gestor.nivel,
+                "debt_count": len(engine.gestor.debt_stack),
+            })
             break
 
     def _advance_session(self):
@@ -822,7 +1025,7 @@ class SessionManager:
         self.signals_this_session = 0
 
 
-# ─── WS READER POR RULETA ─────────────────────────────────────────────────────
+# ─── WS READER ────────────────────────────────────────────────────────────────
 async def ws_reader(ws_key: int, session_mgr: SessionManager):
     reconnect_delay = 5
     initial_loaded  = False
@@ -900,6 +1103,26 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
                                         f"IDs: {len(seen_ids)} | "
                                         f"Warmup: {'✅' if engine.warmup_done else '⏳'}"
                                     )
+
+                                    # ── BROADCAST CARGA INICIAL A HTML ──
+                                    last20 = engine.spin_history[-20:]
+                                    queue_broadcast({
+                                        "type": "spin",
+                                        "number": last20[-1]["number"] if last20 else -1,
+                                        "color": last20[-1]["color"] if last20 else "",
+                                        "dozen": get_dozen(last20[-1]["number"]) if last20 else 0,
+                                        "column": get_column(last20[-1]["number"]) if last20 else 0,
+                                        "spin_count": len(engine.spin_history),
+                                        "warmup_done": engine.warmup_done,
+                                        "last20": [{"number": s["number"], "color": s["color"],
+                                                    "dozen": get_dozen(s["number"]),
+                                                    "column": get_column(s["number"])}
+                                                   for s in last20],
+                                        "signal_active": False,
+                                        "balance": GLOBAL_STATS.global_bankroll,
+                                        "nivel": engine.gestor.nivel,
+                                        "debt_count": len(engine.gestor.debt_stack),
+                                    })
                                 continue
 
                             latest = results[0]
@@ -941,13 +1164,124 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
             reconnect_delay = min(reconnect_delay * 2, 60)
 
 
+# ─── WEBSOCKET SERVER PARA HTML ───────────────────────────────────────────────
+async def _ws_server_handler(websocket):
+    q = asyncio.Queue(maxsize=200)
+    _ws_clients.add(q)
+    remote = websocket.remote_address if websocket.remote_address else "unknown"
+    logger.info(f"[WS-Server] 📡 Cliente conectado desde {remote} | Total: {len(_ws_clients)}")
+    try:
+        # ── Enviar estado inicial al conectarse ──
+        if session_mgr_global and session_mgr_global.engines:
+            engine = session_mgr_global.engines[0]
+            last20 = engine.spin_history[-20:]
+            elapsed = int(time.time() - session_mgr_global.session_start)
+            remaining = max(0, SESSION_ACTIVE - elapsed)
+
+            signal_data = None
+            if engine.signal_active:
+                gale_num = engine.gestor.oportunidad - 1
+                bet = engine.gestor.apostar_por_docena(engine.bankroll)
+                nums = sorted([p[1:] for p in engine.active_pair])
+                signal_data = {
+                    "active": True,
+                    "type": engine.active_type,
+                    "pair": list(engine.active_pair),
+                    "pair_nums": nums,
+                    "missing": engine.active_missing,
+                    "prob": round(engine._last_signal_prob, 4),
+                    "attempt": engine.gestor.oportunidad,
+                    "gale": gale_num,
+                    "bet_per_cat": bet,
+                    "total_bet": bet * 2,
+                }
+
+            total = GLOBAL_STATS.wins + GLOBAL_STATS.zeros + GLOBAL_STATS.losses
+            eff = ((GLOBAL_STATS.wins + GLOBAL_STATS.zeros) / total * 100) if total > 0 else 0.0
+
+            init_msg = {
+                "type": "init",
+                "roulette": engine.name,
+                "spins": [{"number": s["number"], "color": s["color"],
+                           "dozen": get_dozen(s["number"]),
+                           "column": get_column(s["number"])}
+                          for s in last20],
+                "signal": signal_data,
+                "session": {
+                    "active": session_mgr_global.session_active,
+                    "elapsed": elapsed,
+                    "remaining": remaining,
+                    "signals_count": session_mgr_global.signals_this_session,
+                    "max_signals": MAX_SIGNALS,
+                },
+                "balance": GLOBAL_STATS.global_bankroll,
+                "nivel": engine.gestor.nivel,
+                "debt_count": len(engine.gestor.debt_stack),
+                "stats": {
+                    "wins": GLOBAL_STATS.wins,
+                    "losses": GLOBAL_STATS.losses,
+                    "empates": GLOBAL_STATS.zeros,
+                    "consecutive": GLOBAL_STATS.consecutive,
+                    "assertiveness": round(eff, 2),
+                    "total_signals": total,
+                },
+            }
+            await websocket.send(json.dumps(init_msg))
+
+        # ── Loop: enviar mensajes encolados + mantener conexión ──
+        async def sender():
+            while True:
+                data = await q.get()
+                try:
+                    await websocket.send(json.dumps(data))
+                except Exception:
+                    break
+
+        async def receiver():
+            async for msg in websocket:
+                pass
+
+        sender_task = asyncio.create_task(sender())
+        receiver_task = asyncio.create_task(receiver())
+        try:
+            await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
+        finally:
+            sender_task.cancel()
+            receiver_task.cancel()
+            try:
+                await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
+            except Exception:
+                pass
+
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    except Exception as e:
+        logger.debug(f"[WS-Server] Error en handler: {e}")
+    finally:
+        _ws_clients.discard(q)
+        logger.info(f"[WS-Server] 📡 Cliente desconectado | Total: {len(_ws_clients)}")
+
+
+async def _ws_server_main():
+    logger.info(f"[WS-Server] 🌐 Iniciando WebSocket server en 0.0.0.0:{WS_SERVER_PORT}")
+    async with websockets.serve(
+        _ws_server_handler,
+        "0.0.0.0",
+        WS_SERVER_PORT,
+        ping_interval=20,
+        ping_timeout=40,
+        close_timeout=10,
+    ):
+        await asyncio.Future()
+
+
 # ─── FLASK ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 session_mgr_global: Optional[SessionManager] = None
 
 @app.route("/")
 def home():
-    return jsonify({"status": "ok", "bot": "Main Roulette Bot — 12 ruletas / 3 señales máx"})
+    return jsonify({"status": "ok", "bot": "Speed Roulette 2 DC — 6 niveles / 3 señales máx"})
 
 @app.route("/ping")
 def ping():
@@ -967,9 +1301,15 @@ def health():
         "signals_this_session": session_mgr_global.signals_this_session,
         "max_signals":          MAX_SIGNALS,
         "signal_active":        active.signal_active,
+        "ws_server_port":       WS_SERVER_PORT,
+        "ws_clients_connected": len(_ws_clients),
+        "nivel":                active.gestor.nivel,
+        "debt_count":           len(active.gestor.debt_stack),
+        "bankroll":             active.bankroll,
         "engines": [
             {"name": e.name, "spins": len(e.spin_history),
-             "warmup": e.warmup_done, "balance": e.bankroll}
+             "warmup": e.warmup_done, "balance": e.bankroll,
+             "nivel": e.gestor.nivel, "debt_count": len(e.gestor.debt_stack)}
             for e in session_mgr_global.engines
         ]
     })
@@ -1002,13 +1342,14 @@ async def daily_stats_loop():
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
     bot.reply_to(m,
-        "<b>🎰 Main Roulette Bot</b>\n\n"
-        "12 ruletas rotando cada 30 min\n"
-        "Máx 3 señales por sesión | 1 gale máximo\n"
-        "📊 Stats diarias a las 12:00 hs (ARG)\n\n"
+        "<b>🎰 Speed Roulette 2 DC</b>\n\n"
+        "Gestión 6 niveles | Máx 3 señales por sesión\n"
+        "1 gale máximo por señal | Capital inicial: 0\n"
+        "📊 Stats cada 20 señales y diario 12:00 (ARG)\n\n"
         "/status — Estado actual\n"
         "/stats — Ver estadísticas\n"
-        "/siguiente — Forzar cambio de ruleta",
+        "/reset — Resetear stats y bankroll\n"
+        "/siguiente — Forzar nueva sesión",
         parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
@@ -1024,7 +1365,10 @@ def cmd_status(m):
         f"<b>Estado:</b> {st}\n"
         f"<b>Tiempo restante:</b> {remaining} min\n"
         f"<b>Señales en sesión:</b> {session_mgr_global.signals_this_session}/{MAX_SIGNALS}\n"
-        f"<b>Balance global:</b> {GLOBAL_STATS.global_bankroll:.2f}",
+        f"<b>Nivel:</b> {active.gestor.nivel}/{MAX_NIVEL}\n"
+        f"<b>Deudas:</b> {len(active.gestor.debt_stack)}\n"
+        f"<b>Balance:</b> {GLOBAL_STATS.global_bankroll:.2f}\n"
+        f"<b>Clientes HTML:</b> {len(_ws_clients)}",
         parse_mode="HTML")
 
 @bot.message_handler(commands=['stats'])
@@ -1032,12 +1376,23 @@ def cmd_stats(m):
     if not session_mgr_global: return
     tg_send_stats(GLOBAL_STATS.get_stats_text())
 
+@bot.message_handler(commands=['reset'])
+def cmd_reset(m):
+    if not session_mgr_global: return
+    engine = session_mgr_global.engines[session_mgr_global.current_idx]
+    global GLOBAL_STATS
+    GLOBAL_STATS = GlobalStats()
+    engine.bankroll = 0.0
+    engine.gestor.nivel = 1
+    engine.gestor.debt_stack = []
+    bot.reply_to(m, "🔄 <b>Resetado — Balance: 0.00 | Nivel: 1</b>", parse_mode="HTML")
+
 @bot.message_handler(commands=['siguiente'])
 def cmd_siguiente(m):
     if not session_mgr_global: return
     session_mgr_global._advance_session()
     active = session_mgr_global.engines[session_mgr_global.current_idx]
-    bot.reply_to(m, f"🔄 Cambiado a: <b>{active.name}</b>", parse_mode="HTML")
+    bot.reply_to(m, f"🔄 Reiniciada sesión en: <b>{active.name}</b>", parse_mode="HTML")
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -1064,11 +1419,13 @@ async def main():
         asyncio.create_task(session_mgr_global.session_watchdog()),
         asyncio.create_task(daily_stats_loop()),
         asyncio.create_task(self_ping_loop()),
+        asyncio.create_task(_ws_server_main()),
     ]
     for r in ROULETTES:
         tasks.append(asyncio.create_task(ws_reader(r["key"], session_mgr_global)))
 
-    logger.info("[Main] 🎰 Bot iniciado — 12 ruletas / 30 min por sesión / máx 3 señales")
+    logger.info(f"[Main] 🎰 Bot iniciado — SPEED ROULETTE 2 / 30 min / máx 3 señales / "
+                f"6 niveles / Cero 10% / WS server puerto {WS_SERVER_PORT}")
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
