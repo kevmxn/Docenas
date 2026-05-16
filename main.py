@@ -3,7 +3,7 @@
 Speed Roulette DC — Bot de señales para Docenas y Columnas
 Sistema PF + PH + ML Cruzado + Gestión (6 niveles, 2 oportunidades)
 + Sesiones de 30 min + WebSocket Server para HTML + Gestión del Cero (10%)
-+ Monitoreo 3 Ruletas (Telegram solo Speed 2, HTML todas)
++ Monitoreo 3 Ruletas (Telegram solo Speed 2, HTML todas) + Keep-Alive
 """
 
 import asyncio
@@ -22,7 +22,7 @@ from sklearn.linear_model import SGDClassifier
 
 import telebot
 import websockets
-from flask import Flask, jsonify
+from aiohttp import web, ClientSession
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -30,7 +30,7 @@ from urllib3.util.retry import Retry
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [SpeedDC] %(levelname)s %(message)s')
 logger = logging.getLogger("SpeedDC")
-for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3', 'telegram']:
+for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3', 'telegram', 'aiohttp.access']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
 # ─── TELEGRAM ROBUSTO ────────────────────────────────────────────────────────
@@ -69,7 +69,6 @@ MIN_PROB            = 0.78
 TRAIN_INTERVAL      = 100
 MAX_SIGNALS         = 3
 SIGNAL_WAIT_TIMEOUT = 120
-WS_SERVER_PORT      = int(os.environ.get("WS_SERVER_PORT", 8765))
 
 REAL_COLOR_MAP = {0:"VERDE",1:"ROJO",2:"NEGRO",3:"ROJO",4:"NEGRO",5:"ROJO",6:"NEGRO",7:"ROJO",8:"NEGRO",9:"ROJO",10:"NEGRO",11:"NEGRO",12:"ROJO",13:"NEGRO",14:"ROJO",15:"NEGRO",16:"ROJO",17:"NEGRO",18:"ROJO",19:"ROJO",20:"NEGRO",21:"ROJO",22:"NEGRO",23:"ROJO",24:"NEGRO",25:"ROJO",26:"NEGRO",27:"ROJO",28:"NEGRO",29:"NEGRO",30:"ROJO",31:"NEGRO",32:"ROJO",33:"NEGRO",34:"ROJO",35:"NEGRO",36:"ROJO"}
 
@@ -346,7 +345,7 @@ class RouletteEngine:
             if self.name=="SPEED ROULETTE 2": GLOBAL_STATS.global_bankroll=self.bankroll
             if gale_num==0:
                 if self.name=="SPEED ROULETTE 2" and self.active_signal_msg_id: tg_delete(CHAT_ID,self.active_signal_msg_id); self.active_signal_msg_id=None
-                self.gestor.oportunidad=2; self.send_signal(); return False
+                self.gestor.oportunidad=2; self.send_signal(send_tg=(self.name=="SPEED ROULETTE 2")); return False
             else:
                 cat_label=f"{'DOCENA' if type_str=='DOCENA' else 'COLUMNA'} {val_num}"
                 if self.name=="SPEED ROULETTE 2": GLOBAL_STATS.record('LOSS',2,number,val_num,type_str,self.name); tg_send(f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}\n🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}")
@@ -491,8 +490,6 @@ async def ws_reader(ws_key, session_mgr):
         except: await asyncio.sleep(reconnect_delay); reconnect_delay=min(reconnect_delay*2,60)
 
 # ─── AIOHTTP SERVER + KEEP-ALIVE ─────────────────────────────────────────────
-from aiohttp import web, ClientSession
-
 async def ws_html_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -513,26 +510,21 @@ async def ws_html_handler(request):
 async def health_handler(request):
     return web.json_response({"status": "ok", "roulettes": [r["name"] for r in ROULETTES]})
 
-# ── TAREA KEEP-ALIVE PARA RENDER ──
 async def self_ping():
-    """Evita que Render suspenda el servicio por inactividad haciéndole ping a sí mismo."""
+    """Evita que Render suspenda el servicio por inactividad."""
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not render_url:
         logger.info("[KeepAlive] RENDER_EXTERNAL_URL no definida. Auto-ping desactivado (ejecución local).")
         return
-    
     health_url = f"{render_url}/health"
     logger.info(f"[KeepAlive] Auto-ping configurado cada 10 min hacia {health_url}")
-    
     while True:
-        await asyncio.sleep(600)  # Espera 10 minutos (600 segundos)
+        await asyncio.sleep(600) # 10 minutos
         try:
             async with ClientSession() as session:
                 async with session.get(health_url, timeout=5) as resp:
-                    if resp.status == 200:
-                        logger.info("[KeepAlive] ✅ Ping exitoso. Servidor activo.")
-                    else:
-                        logger.warning(f"[KeepAlive] ⚠️ Ping respondió con status: {resp.status}")
+                    if resp.status == 200: logger.info("[KeepAlive] ✅ Ping exitoso. Servidor activo.")
+                    else: logger.warning(f"[KeepAlive] ⚠️ Ping respondió con status: {resp.status}")
         except Exception as e:
             logger.error(f"[KeepAlive] ❌ Error en auto-ping: {e}")
 
