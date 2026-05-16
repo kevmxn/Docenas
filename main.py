@@ -490,26 +490,68 @@ async def ws_reader(ws_key, session_mgr):
                 finally: poll_task.cancel()
         except: await asyncio.sleep(reconnect_delay); reconnect_delay=min(reconnect_delay*2,60)
 
-# ─── FLASK & WS SERVER ──────────────────────────────────────────────────────
-app = Flask(__name__)
-@app.route('/health')
-def health(): return jsonify({"status":"ok"})
+# ─── AIOHTTP SERVER + KEEP-ALIVE ─────────────────────────────────────────────
+from aiohttp import web, ClientSession
 
-async def ws_html_handler(websocket, path=None):
-    q=asyncio.Queue(); _ws_clients.add(q)
+async def ws_html_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    
+    q = asyncio.Queue()
+    _ws_clients.add(q)
     try:
         while True:
-            data=await q.get()
-            try: await websocket.send(json.dumps(data))
-            except: break
-    finally: _ws_clients.discard(q)
+            data = await q.get()
+            try: 
+                await ws.send_json(data)
+            except Exception: 
+                break
+    finally: 
+        _ws_clients.discard(q)
+        return ws
 
-async def main():
-    session_mgr=SessionManager()
-    readers=[ws_reader(r["key"], session_mgr) for r in ROULETTES]
-    await asyncio.gather(*readers, session_mgr.session_watchdog(), websockets.serve(ws_html_handler, "0.0.0.0", WS_SERVER_PORT))
+async def health_handler(request):
+    return web.json_response({"status": "ok", "roulettes": [r["name"] for r in ROULETTES]})
 
-if __name__=="__main__":
-    import threading
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT",8080)), debug=False), daemon=True).start()
-    asyncio.run(main())
+# ── TAREA KEEP-ALIVE PARA RENDER ──
+async def self_ping():
+    """Evita que Render suspenda el servicio por inactividad haciéndole ping a sí mismo."""
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not render_url:
+        logger.info("[KeepAlive] RENDER_EXTERNAL_URL no definida. Auto-ping desactivado (ejecución local).")
+        return
+    
+    health_url = f"{render_url}/health"
+    logger.info(f"[KeepAlive] Auto-ping configurado cada 10 min hacia {health_url}")
+    
+    while True:
+        await asyncio.sleep(600)  # Espera 10 minutos (600 segundos)
+        try:
+            async with ClientSession() as session:
+                async with session.get(health_url, timeout=5) as resp:
+                    if resp.status == 200:
+                        logger.info("[KeepAlive] ✅ Ping exitoso. Servidor activo.")
+                    else:
+                        logger.warning(f"[KeepAlive] ⚠️ Ping respondió con status: {resp.status}")
+        except Exception as e:
+            logger.error(f"[KeepAlive] ❌ Error en auto-ping: {e}")
+
+async def background_tasks(app):
+    """Inicia las tareas en segundo plano al arrancar el servidor"""
+    session_mgr = SessionManager()
+    readers = [ws_reader(r["key"], session_mgr) for r in ROULETTES]
+    for reader in readers:
+        asyncio.create_task(reader)
+    asyncio.create_task(session_mgr.session_watchdog())
+    asyncio.create_task(self_ping()) # Iniciar el keep-alive
+
+app = web.Application()
+app.router.add_get('/ws', ws_html_handler)
+app.router.add_get('/', health_handler)
+app.router.add_get('/health', health_handler)
+app.on_startup.append(background_tasks)
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    logger.info(f"[Server] Iniciando servidor unificado en puerto {port}")
+    web.run_app(app, host="0.0.0.0", port=port)
