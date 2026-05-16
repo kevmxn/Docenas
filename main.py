@@ -235,7 +235,12 @@ class RouletteEngine:
         logger.info(f"[{name}] Pre-cargados: {live} giros | Warmup: {'✅' if self.warmup_done else '⏳'}")
 
     def _get_db(self): conn=sqlite3.connect(self.db_path,check_same_thread=False); conn.execute("CREATE TABLE IF NOT EXISTS live_spins (id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, ts INTEGER NOT NULL)"); conn.commit(); return conn
-    def _persist(self, n): try: self._db.execute("INSERT INTO live_spins(number,ts) VALUES(?,?)",(n,int(time.time())));self._db.commit(); except: pass
+    def _persist(self, n):
+        try:
+            self._db.execute("INSERT INTO live_spins(number,ts) VALUES(?,?)", (n, int(time.time())))
+            self._db.commit()
+        except:
+            pass
     def _load_live_history(self):
         try: rows=self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
         except: return 0
@@ -483,13 +488,27 @@ async def ws_reader(ws_key, session_mgr):
                         if not fallback_gid or not is_new_id(fallback_gid): continue
                         for key in ("result","number","outcome","winningNumber"):
                             if key in data:
-                                try: n=int(data[key]); 
-                                if 0<=n<=36: session_mgr.on_number(ws_key,n); break
+                                try:
+                                    n=int(data[key])
+                                    if 0<=n<=36: session_mgr.on_number(ws_key,n); break
                                 except: pass
                 finally: poll_task.cancel()
         except: await asyncio.sleep(reconnect_delay); reconnect_delay=min(reconnect_delay*2,60)
 
 # ─── AIOHTTP SERVER + KEEP-ALIVE ─────────────────────────────────────────────
+@web.middleware
+async def cors_middleware(request, handler):
+    """Permite que el HTML externo (file:// o cualquier origen) se conecte al servidor."""
+    if request.method == "OPTIONS":
+        resp = web.Response()
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp
+    response = await handler(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
 async def ws_html_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -537,7 +556,7 @@ async def background_tasks(app):
     asyncio.create_task(session_mgr.session_watchdog())
     asyncio.create_task(self_ping()) # Iniciar el keep-alive
 
-app = web.Application()
+app = web.Application(middlewares=[cors_middleware])
 app.router.add_get('/ws', ws_html_handler)
 app.router.add_get('/', health_handler)
 app.router.add_get('/health', health_handler)
