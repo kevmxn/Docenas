@@ -231,6 +231,8 @@ class RouletteEngine:
         self.signal_active=False; self.active_type=None; self.active_pair=(); self.active_missing=""
         self._last_signal_prob=0.0; self.gestor=GestorDocenas(); self.total_signal_loss=0.0; self.bankroll=0.0
         self.active_signal_msg_id=None; self.spins_since_train=0; self.ws_count=0; self.warmup_done=False
+        # Per-engine signal counters (used by HTML for all roulettes)
+        self.stat_wins=0; self.stat_losses=0; self.stat_zeros=0
         self._db=self._get_db(); live=self._load_live_history(); self.ws_count=live; self.warmup_done=live>=WARMUP_SPINS
         logger.info(f"[{name}] Pre-cargados: {live} giros | Warmup: {'✅' if self.warmup_done else '⏳'}")
 
@@ -319,7 +321,7 @@ class RouletteEngine:
             msg_id=tg_send_with_button(self._build_signal_text(), self.name)
             if msg_id: self.active_signal_msg_id=msg_id
         gale_num=self.gestor.oportunidad-1; bet=self.gestor.apostar_por_docena(self.bankroll); nums=sorted([p[1:] for p in self.active_pair])
-        queue_broadcast({"type":"signal","ws_key":self.ws_key,"roulette":self.name,"signal_type":self.active_type,"pair":list(self.active_pair),"pair_nums":nums,"missing":self.active_missing,"prob":round(self._last_signal_prob,4),"attempt":self.gestor.oportunidad,"gale":gale_num,"bet_per_cat":bet,"total_bet":bet*2,"balance":GLOBAL_STATS.global_bankroll if self.name=="SPEED ROULETTE 2" else self.bankroll,"nivel":self.gestor.nivel,"debt_count":len(self.gestor.debt_stack)})
+        queue_broadcast({"type":"signal","ws_key":self.ws_key,"roulette":self.name,"signal_type":self.active_type,"pair":list(self.active_pair),"pair_nums":nums,"missing":self.active_missing,"prob":round(self._last_signal_prob,4),"attempt":self.gestor.oportunidad,"gale":gale_num,"bet_per_cat":bet,"total_bet":bet*2,"balance":self.bankroll,"nivel":self.gestor.nivel,"wins":self.stat_wins,"losses":self.stat_losses,"zeros":self.stat_zeros,"debt_count":len(self.gestor.debt_stack)})
 
     def iniciar_senal(self, sig, send_tg=True):
         self.signal_active=True;self.active_type=sig["type"];self.active_pair=sig["pair"];self.active_missing=sig["missing"];self._last_signal_prob=sig.get("prob",0)
@@ -332,8 +334,9 @@ class RouletteEngine:
         if number==0:
             zero_payout=round(zero_bet*36,2); spin_profit=round(zero_payout-spin_investment,2); self.bankroll=round(self.bankroll+spin_profit,2); signal_profit=round(spin_profit-self.total_signal_loss,2)
             self.gestor.verificar_recuperacion(self.bankroll)
+            self.stat_zeros+=1
             if self.name=="SPEED ROULETTE 2": GLOBAL_STATS.global_bankroll=self.bankroll; GLOBAL_STATS.record('EMPATE',self.gestor.oportunidad,0,0,type_str,self.name); tg_send(f"🟠 EMPATE 0 — ZERO — 🔄 GALE #{gale_num}\n🉑 Para la próxima ganaremos {signal_profit:.2f} 🉑\n💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}")
-            queue_broadcast({"type":"result","ws_key":self.ws_key,"roulette":self.name,"result":"EMPATE","number":0,"color":"VERDE","dozen":0,"column":0,"detail":"ZERO","attempt":self.gestor.oportunidad,"gale":gale_num,"profit":signal_profit,"balance":GLOBAL_STATS.global_bankroll if self.name=="SPEED ROULETTE 2" else self.bankroll,"total_loss":0.0,"nivel":self.gestor.nivel,"debt_count":len(self.gestor.debt_stack)})
+            queue_broadcast({"type":"result","ws_key":self.ws_key,"roulette":self.name,"result":"EMPATE","number":0,"color":"VERDE","dozen":0,"column":0,"detail":"ZERO","attempt":gale_num+1,"gale":gale_num,"profit":signal_profit,"balance":self.bankroll,"total_loss":0.0,"nivel":self.gestor.nivel,"wins":self.stat_wins,"losses":self.stat_losses,"zeros":self.stat_zeros,"debt_count":len(self.gestor.debt_stack)})
             if self.name=="SPEED ROULETTE 2": self._check_stats()
             self._reset_signal(); return True
 
@@ -341,8 +344,9 @@ class RouletteEngine:
         if won:
             dozen_payout=round(3*bet,2); spin_profit=round(dozen_payout-spin_investment,2); self.bankroll=round(self.bankroll+spin_profit,2); signal_profit=round(spin_profit-self.total_signal_loss,2)
             self.gestor.verificar_recuperacion(self.bankroll); cat_label=f"{'DOCENA' if type_str=='DOCENA' else 'COLUMNA'} {val_num}"
+            self.stat_wins+=1
             if self.name=="SPEED ROULETTE 2": GLOBAL_STATS.global_bankroll=self.bankroll; GLOBAL_STATS.record('WIN',self.gestor.oportunidad,number,val_num,type_str,self.name); tg_send(f"✅ WIN {number} — {cat_label} — 🔄 GALE #{gale_num}\n🎉 Felicidades has ganado {signal_profit:.2f} 🎉\n💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}")
-            queue_broadcast({"type":"result","ws_key":self.ws_key,"roulette":self.name,"result":"WIN","number":number,"color":REAL_COLOR_MAP.get(number,"VERDE"),"dozen":d,"column":c,"detail":cat_label,"attempt":self.gestor.oportunidad,"gale":gale_num,"profit":signal_profit,"balance":GLOBAL_STATS.global_bankroll if self.name=="SPEED ROULETTE 2" else self.bankroll,"total_loss":0.0,"nivel":self.gestor.nivel,"debt_count":len(self.gestor.debt_stack)})
+            queue_broadcast({"type":"result","ws_key":self.ws_key,"roulette":self.name,"result":"WIN","number":number,"color":REAL_COLOR_MAP.get(number,"VERDE"),"dozen":d,"column":c,"detail":cat_label,"attempt":gale_num+1,"gale":gale_num,"profit":signal_profit,"balance":self.bankroll,"total_loss":0.0,"nivel":self.gestor.nivel,"wins":self.stat_wins,"losses":self.stat_losses,"zeros":self.stat_zeros,"debt_count":len(self.gestor.debt_stack)})
             if self.name=="SPEED ROULETTE 2": self._check_stats()
             self._reset_signal(); return True
         else:
@@ -353,9 +357,10 @@ class RouletteEngine:
                 self.gestor.oportunidad=2; self.send_signal(send_tg=(self.name=="SPEED ROULETTE 2")); return False
             else:
                 cat_label=f"{'DOCENA' if type_str=='DOCENA' else 'COLUMNA'} {val_num}"
+                self.stat_losses+=1
                 if self.name=="SPEED ROULETTE 2": GLOBAL_STATS.record('LOSS',2,number,val_num,type_str,self.name); tg_send(f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}\n🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}")
                 self.gestor.registrar_perdida_senal()
-                queue_broadcast({"type":"result","ws_key":self.ws_key,"roulette":self.name,"result":"LOSS","number":number,"color":REAL_COLOR_MAP.get(number,"VERDE"),"dozen":d,"column":c,"detail":cat_label,"attempt":2,"gale":gale_num,"profit":-self.total_signal_loss,"balance":GLOBAL_STATS.global_bankroll if self.name=="SPEED ROULETTE 2" else self.bankroll,"total_loss":self.total_signal_loss,"nivel":self.gestor.nivel,"debt_count":len(self.gestor.debt_stack)})
+                queue_broadcast({"type":"result","ws_key":self.ws_key,"roulette":self.name,"result":"LOSS","number":number,"color":REAL_COLOR_MAP.get(number,"VERDE"),"dozen":d,"column":c,"detail":cat_label,"attempt":2,"gale":gale_num,"profit":-self.total_signal_loss,"balance":self.bankroll,"total_loss":self.total_signal_loss,"nivel":self.gestor.nivel,"wins":self.stat_wins,"losses":self.stat_losses,"zeros":self.stat_zeros,"debt_count":len(self.gestor.debt_stack)})
                 if self.name=="SPEED ROULETTE 2": self._check_stats()
                 self._reset_signal(); return True
 
@@ -370,7 +375,7 @@ class RouletteEngine:
         if not self.warmup_done:
             self.ws_count+=1
             if self.ws_count>=WARMUP_SPINS: self.warmup_done=True; tg_send(f"🟢 <b>{self.name}</b> — Sistema PF+PH+ML Listo.") if self.name=="SPEED ROULETTE 2" else None
-        queue_broadcast({"type":"spin","ws_key":self.ws_key,"roulette":self.name,"number":number,"color":REAL_COLOR_MAP.get(number),"dozen":get_dozen(number),"column":get_column(number),"spin_count":len(self.spin_history),"warmup_done":self.warmup_done,"balance":GLOBAL_STATS.global_bankroll if self.name=="SPEED ROULETTE 2" else self.bankroll,"nivel":self.gestor.nivel,"debt_count":len(self.gestor.debt_stack)})
+        queue_broadcast({"type":"spin","ws_key":self.ws_key,"roulette":self.name,"number":number,"color":REAL_COLOR_MAP.get(number),"dozen":get_dozen(number),"column":get_column(number),"spin_count":len(self.spin_history),"warmup_done":self.warmup_done,"balance":self.bankroll,"nivel":self.gestor.nivel,"wins":self.stat_wins,"losses":self.stat_losses,"zeros":self.stat_zeros,"debt_count":len(self.gestor.debt_stack)})
 
 # ─── SESSION MANAGER ORIGINAL ────────────────────────────────────────────────
 class SessionManager:
@@ -394,7 +399,7 @@ class SessionManager:
         logger.info(f"[SessionManager] 🟢 Sesión iniciada: {engine.name} | {now_str}–{end_str} (ARG)")
         if self.prev_start_msg_id: tg_delete(CHAT_ID,self.prev_start_msg_id); self.prev_start_msg_id=None
         self.prev_start_msg_id=tg_send(f"🔔 SESION INICIADA — {engine.name} 🔔")
-        queue_broadcast({"type":"session","status":"started","roulette":engine.name,"elapsed":0,"remaining":SESSION_ACTIVE,"signals_count":0,"max_signals":MAX_SIGNALS,"nivel":engine.gestor.nivel,"debt_count":len(engine.gestor.debt_stack)})
+        queue_broadcast({"type":"session","status":"started","ws_key":engine.ws_key,"roulette":engine.name,"elapsed":0,"remaining":SESSION_ACTIVE,"signals_count":0,"max_signals":MAX_SIGNALS,"nivel":engine.gestor.nivel,"debt_count":len(engine.gestor.debt_stack)})
 
     def _end_session(self):
         engine=self.engines.get(205)
@@ -402,14 +407,20 @@ class SessionManager:
         if self.prev_end_msg_id: tg_delete(CHAT_ID,self.prev_end_msg_id); self.prev_end_msg_id=None
         text=f"⏸ SESIÓN CERRADA — {engine.name}\n🎰 PRÓXIMA RULETA — {engine.name} 🎰\n\n💵 ¿COMO OPERAR LAS SEÑALES?\n\n1° Op. = $0.50 USD x Docena/Columna\n2° Op. = $1.50 USD x Docena/Columna\n\n🎯 FUNCIONAMIENTO DE LAS SEÑALES 🎯\n\n  • Se envían las señales → Se resuelven\n  • Sesión se cierra → Ej: 12:25 o 12:55\n  • Nueva Sesión → Ej: 15:00 o 15:30\n  • Nueva Señal → Ciclo de señales\n\n♦️ POR SESION SE ENVÍAN 3 SEÑALES MÁXIMAS ♦️"
         self.prev_end_msg_id=tg_send_with_button(text, engine.name)
-        queue_broadcast({"type":"session","status":"ended","roulette":engine.name,"elapsed":SESSION_ACTIVE,"remaining":0,"signals_count":self.signals_this_session,"max_signals":MAX_SIGNALS,"nivel":engine.gestor.nivel,"debt_count":len(engine.gestor.debt_stack)})
+        queue_broadcast({"type":"session","status":"ended","ws_key":engine.ws_key,"roulette":engine.name,"elapsed":SESSION_ACTIVE,"remaining":0,"signals_count":self.signals_this_session,"max_signals":MAX_SIGNALS,"nivel":engine.gestor.nivel,"debt_count":len(engine.gestor.debt_stack)})
 
     async def session_watchdog(self):
         wait=self.seconds_to_next_slot(); logger.info(f"[SessionManager] ⏳ Esperando {wait/60:.1f} min para el primer slot..."); await asyncio.sleep(wait); self._start_session()
-        _waiting_signal_since=None
+        _waiting_signal_since=None; _last_timer_tick=0
         while True:
             await asyncio.sleep(1); now=time.time(); elapsed=now-self.session_start; engine=self.engines.get(205)
             if self.session_active:
+                # Broadcast timer every 5 seconds so HTML status bar stays current
+                remaining_active=max(0, SESSION_ACTIVE-elapsed)
+                if now-_last_timer_tick>=5:
+                    _last_timer_tick=now
+                    mins,secs=divmod(int(remaining_active),60)
+                    queue_broadcast({"type":"timer","status":"active","ws_key":engine.ws_key,"roulette":engine.name,"remaining":remaining_active,"text":f"{mins:02d}:{secs:02d}"})
                 if elapsed>=SESSION_ACTIVE:
                     if engine.signal_active:
                         if _waiting_signal_since is None: _waiting_signal_since=now; logger.info(f"[SessionManager] ⏳ Sesión terminada pero señal activa — esperando resolución...")
@@ -420,7 +431,15 @@ class SessionManager:
                         else: continue
                     else: _waiting_signal_since=None
                     end_time=time.time(); self._end_session(); pause_remaining=SESSION_TOTAL-(end_time-self.session_start)
-                    if pause_remaining>0: await asyncio.sleep(pause_remaining)
+                    if pause_remaining>0:
+                        # Broadcast pause timer during break
+                        pause_start=time.time()
+                        while True:
+                            await asyncio.sleep(1); p_elapsed=time.time()-pause_start; p_remaining=max(0,pause_remaining-p_elapsed)
+                            if time.time()-_last_timer_tick>=5:
+                                _last_timer_tick=time.time(); pm,ps=divmod(int(p_remaining),60)
+                                queue_broadcast({"type":"timer","status":"paused","ws_key":engine.ws_key,"roulette":engine.name,"remaining":p_remaining,"text":f"{pm:02d}:{ps:02d}"})
+                            if p_elapsed>=pause_remaining: break
                     self._start_session()
             else:
                 if elapsed>=SESSION_TOTAL: self._start_session()
