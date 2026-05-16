@@ -316,27 +316,93 @@ class RouletteEngine:
         gale_num=self.gestor.oportunidad-1; bet=self.gestor.apostar_por_docena(self.bankroll); total_bet=bet*2
         return (f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n🕹️ {self.name}\n🎯 Entrar en las {type_str}: {pair_disp}\n💰 Balance: {GLOBAL_STATS.global_bankroll:.2f}\n💵 Apuesta total: {total_bet:.2f}\n🚨 (por {singular}: {bet:.2f})\n⚔️ Cubrir el CERO 🟢\n🛟 GALE #{gale_num}")
 
+    def _build_signal_ws(self) -> dict:
+        """
+        Builds the WebSocket 'signal' payload consumed by the HTML.
+        Fields guaranteed:
+          type, ws_key, roulette, signal_type, pair (list of str e.g. ["D1","D2"]),
+          pair_nums (list of str e.g. ["1","2"]), missing (str), prob, attempt,
+          gale, bet_per_cat, total_bet, balance, nivel, wins, losses, zeros, debt_count
+        """
+        gale_num = self.gestor.oportunidad - 1
+        bet = self.gestor.apostar_por_docena(self.bankroll)
+        # pair is already a tuple of strings like ("D1","D2") or ("C1","C2")
+        pair_list = list(self.active_pair)
+        pair_nums = [p[1:] for p in pair_list]  # ["1","2"]
+        return {
+            "type": "signal",
+            "ws_key": self.ws_key,
+            "roulette": self.name,
+            "signal_type": self.active_type,       # "DOCENA" or "COLUMNA"
+            "pair": pair_list,                     # ["D1","D2"] or ["C1","C2"]
+            "pair_nums": pair_nums,                # ["1","2"]
+            "missing": self.active_missing,        # "D3" or "C3"
+            "prob": round(self._last_signal_prob, 4),
+            "attempt": self.gestor.oportunidad,    # 1 = first attempt, 2 = gale
+            "gale": gale_num,
+            "bet_per_cat": round(bet, 2),
+            "total_bet": round(bet * 2, 2),
+            "balance": round(self.bankroll, 2),
+            "nivel": self.gestor.nivel,
+            "wins": self.stat_wins,
+            "losses": self.stat_losses,
+            "zeros": self.stat_zeros,
+            "debt_count": len(self.gestor.debt_stack),
+        }
+
     def send_signal(self, send_tg=True):
         if send_tg and self.name=="SPEED ROULETTE 2":
             msg_id=tg_send_with_button(self._build_signal_text(), self.name)
             if msg_id: self.active_signal_msg_id=msg_id
-        gale_num=self.gestor.oportunidad-1; bet=self.gestor.apostar_por_docena(self.bankroll); nums=sorted([p[1:] for p in self.active_pair])
-        queue_broadcast({"type":"signal","ws_key":self.ws_key,"roulette":self.name,"signal_type":self.active_type,"pair":list(self.active_pair),"pair_nums":nums,"missing":self.active_missing,"prob":round(self._last_signal_prob,4),"attempt":self.gestor.oportunidad,"gale":gale_num,"bet_per_cat":bet,"total_bet":bet*2,"balance":self.bankroll,"nivel":self.gestor.nivel,"wins":self.stat_wins,"losses":self.stat_losses,"zeros":self.stat_zeros,"debt_count":len(self.gestor.debt_stack)})
+        queue_broadcast(self._build_signal_ws())
 
     def iniciar_senal(self, sig, send_tg=True):
         self.signal_active=True;self.active_type=sig["type"];self.active_pair=sig["pair"];self.active_missing=sig["missing"];self._last_signal_prob=sig.get("prob",0)
         self.gestor.iniciar_senal(self.bankroll);self.total_signal_loss=0.0;self.send_signal(send_tg); logger.info(f"[{self.name}] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
 
+    def _build_result_ws(self, result: str, number: int, gale_num: int,
+                         signal_profit: float, cat_label: str = "") -> dict:
+        """
+        Builds the WebSocket 'result' payload consumed by the HTML.
+        Fields guaranteed:
+          type, ws_key, roulette, result, number, color, dozen, column,
+          detail, attempt, gale, profit, balance, total_loss,
+          nivel, wins, losses, zeros, debt_count
+        """
+        d = get_dozen(number)
+        c = get_column(number)
+        return {
+            "type": "result",
+            "ws_key": self.ws_key,
+            "roulette": self.name,
+            "result": result,                           # "WIN" | "LOSS" | "EMPATE"
+            "number": number,
+            "color": REAL_COLOR_MAP.get(number, "VERDE"),
+            "dozen": d,
+            "column": c,
+            "detail": cat_label,
+            "attempt": gale_num + 1,
+            "gale": gale_num,
+            "profit": round(signal_profit, 2),
+            "balance": round(self.bankroll, 2),
+            "total_loss": round(self.total_signal_loss, 2),
+            "nivel": self.gestor.nivel,
+            "wins": self.stat_wins,
+            "losses": self.stat_losses,
+            "zeros": self.stat_zeros,
+            "debt_count": len(self.gestor.debt_stack),
+        }
+
     def resolve(self, number):
         d,c=get_dozen(number),get_column(number); type_str=self.active_type; val_num=d if type_str=="DOCENA" else c; gale_num=self.gestor.oportunidad-1
         bet=self.gestor.apostar_por_docena(self.bankroll); zero_bet=round(0.1*bet,2); spin_investment=round((2*bet)+zero_bet,2)
-        
+
         if number==0:
             zero_payout=round(zero_bet*36,2); spin_profit=round(zero_payout-spin_investment,2); self.bankroll=round(self.bankroll+spin_profit,2); signal_profit=round(spin_profit-self.total_signal_loss,2)
             self.gestor.verificar_recuperacion(self.bankroll)
             self.stat_zeros+=1
             if self.name=="SPEED ROULETTE 2": GLOBAL_STATS.global_bankroll=self.bankroll; GLOBAL_STATS.record('EMPATE',self.gestor.oportunidad,0,0,type_str,self.name); tg_send(f"🟠 EMPATE 0 — ZERO — 🔄 GALE #{gale_num}\n🉑 Para la próxima ganaremos {signal_profit:.2f} 🉑\n💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}")
-            queue_broadcast({"type":"result","ws_key":self.ws_key,"roulette":self.name,"result":"EMPATE","number":0,"color":"VERDE","dozen":0,"column":0,"detail":"ZERO","attempt":gale_num+1,"gale":gale_num,"profit":signal_profit,"balance":self.bankroll,"total_loss":0.0,"nivel":self.gestor.nivel,"wins":self.stat_wins,"losses":self.stat_losses,"zeros":self.stat_zeros,"debt_count":len(self.gestor.debt_stack)})
+            queue_broadcast(self._build_result_ws("EMPATE", 0, gale_num, signal_profit, "ZERO"))
             if self.name=="SPEED ROULETTE 2": self._check_stats()
             self._reset_signal(); return True
 
@@ -346,7 +412,7 @@ class RouletteEngine:
             self.gestor.verificar_recuperacion(self.bankroll); cat_label=f"{'DOCENA' if type_str=='DOCENA' else 'COLUMNA'} {val_num}"
             self.stat_wins+=1
             if self.name=="SPEED ROULETTE 2": GLOBAL_STATS.global_bankroll=self.bankroll; GLOBAL_STATS.record('WIN',self.gestor.oportunidad,number,val_num,type_str,self.name); tg_send(f"✅ WIN {number} — {cat_label} — 🔄 GALE #{gale_num}\n🎉 Felicidades has ganado {signal_profit:.2f} 🎉\n💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}")
-            queue_broadcast({"type":"result","ws_key":self.ws_key,"roulette":self.name,"result":"WIN","number":number,"color":REAL_COLOR_MAP.get(number,"VERDE"),"dozen":d,"column":c,"detail":cat_label,"attempt":gale_num+1,"gale":gale_num,"profit":signal_profit,"balance":self.bankroll,"total_loss":0.0,"nivel":self.gestor.nivel,"wins":self.stat_wins,"losses":self.stat_losses,"zeros":self.stat_zeros,"debt_count":len(self.gestor.debt_stack)})
+            queue_broadcast(self._build_result_ws("WIN", number, gale_num, signal_profit, cat_label))
             if self.name=="SPEED ROULETTE 2": self._check_stats()
             self._reset_signal(); return True
         else:
@@ -360,7 +426,7 @@ class RouletteEngine:
                 self.stat_losses+=1
                 if self.name=="SPEED ROULETTE 2": GLOBAL_STATS.record('LOSS',2,number,val_num,type_str,self.name); tg_send(f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}\n🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}")
                 self.gestor.registrar_perdida_senal()
-                queue_broadcast({"type":"result","ws_key":self.ws_key,"roulette":self.name,"result":"LOSS","number":number,"color":REAL_COLOR_MAP.get(number,"VERDE"),"dozen":d,"column":c,"detail":cat_label,"attempt":2,"gale":gale_num,"profit":-self.total_signal_loss,"balance":self.bankroll,"total_loss":self.total_signal_loss,"nivel":self.gestor.nivel,"wins":self.stat_wins,"losses":self.stat_losses,"zeros":self.stat_zeros,"debt_count":len(self.gestor.debt_stack)})
+                queue_broadcast(self._build_result_ws("LOSS", number, gale_num, -self.total_signal_loss, cat_label))
                 if self.name=="SPEED ROULETTE 2": self._check_stats()
                 self._reset_signal(); return True
 
@@ -375,7 +441,26 @@ class RouletteEngine:
         if not self.warmup_done:
             self.ws_count+=1
             if self.ws_count>=WARMUP_SPINS: self.warmup_done=True; tg_send(f"🟢 <b>{self.name}</b> — Sistema PF+PH+ML Listo.") if self.name=="SPEED ROULETTE 2" else None
-        queue_broadcast({"type":"spin","ws_key":self.ws_key,"roulette":self.name,"number":number,"color":REAL_COLOR_MAP.get(number),"dozen":get_dozen(number),"column":get_column(number),"spin_count":len(self.spin_history),"warmup_done":self.warmup_done,"balance":self.bankroll,"nivel":self.gestor.nivel,"wins":self.stat_wins,"losses":self.stat_losses,"zeros":self.stat_zeros,"debt_count":len(self.gestor.debt_stack)})
+        # Build spin broadcast — include ALL fields the HTML expects
+        d = get_dozen(number)
+        c = get_column(number)
+        queue_broadcast({
+            "type": "spin",
+            "ws_key": self.ws_key,
+            "roulette": self.name,
+            "number": number,
+            "color": REAL_COLOR_MAP.get(number, "VERDE"),
+            "dozen": d,
+            "column": c,
+            "spin_count": len(self.spin_history),
+            "warmup_done": self.warmup_done,
+            "balance": round(self.bankroll, 2),
+            "nivel": self.gestor.nivel,
+            "wins": self.stat_wins,
+            "losses": self.stat_losses,
+            "zeros": self.stat_zeros,
+            "debt_count": len(self.gestor.debt_stack),
+        })
 
 # ─── SESSION MANAGER ORIGINAL ────────────────────────────────────────────────
 class SessionManager:
@@ -531,17 +616,17 @@ async def cors_middleware(request, handler):
 async def ws_html_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    
+
     q = asyncio.Queue()
     _ws_clients.add(q)
     try:
         while True:
             data = await q.get()
-            try: 
+            try:
                 await ws.send_json(data)
-            except Exception: 
+            except Exception:
                 break
-    finally: 
+    finally:
         _ws_clients.discard(q)
         return ws
 
