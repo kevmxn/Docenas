@@ -60,8 +60,14 @@ CHAT_ID = -1003821352139
 RUSSIAN_URL = "https://stake1039.com/es/casino/games/pragmatic-play-russian-roulette"
 
 def russian_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("👆🏻 ACCEDER a RUSSIAN ROULETTE", url=RUSSIAN_URL))
+    kb = InlineKeyboardMarkup(row_width=5)
+    kb.add(
+        InlineKeyboardButton("🔵 1win",      url="https://1win.lat/casino/play/v_pragmatic:1winroulette"),
+        InlineKeyboardButton("🟢 Betwinner", url="https://betwinner-06870.pro/mx/casino-search?game=88366"),
+        InlineKeyboardButton("🟡 Melbet",    url="https://melbet-ar3.com/es/casino-search?game=88366"),
+        InlineKeyboardButton("⚪ 1xbet",     url="https://1xbetarge.com/es/casino-search?game=93659"),
+        InlineKeyboardButton("🔴 888Starz",  url="https://play-888starz.com/es/casino-search?game=88366"),
+    )
     return kb
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
@@ -89,10 +95,10 @@ POLL_INTERVAL   = 1
 LIVE_DB         = "russian_live.db"
 
 BASE_BET        = 0.10      # USD — ficha base (v29)
-MAX_NIVEL       = 6
+MAX_NIVEL       = 3
 WARMUP_SPINS    = 25
 MIN_PROB        = 0.78      # umbral base E1 y E3
-MAX_INTENTOS    = 3
+MAX_INTENTOS    = 2
 TRAIN_INTERVAL  = 100
 
 # Pesos PHF = PHTML(80%) + PH(20%)
@@ -427,9 +433,12 @@ class OnlineEnsemblePredictor:
 # ─── GESTOR DE FICHAS Y NIVELES ───────────────────────────────────────────────
 class GestorDocenas:
     """
-    Intento 1  → nivel × BASE_BET
-    Intentos 2-3 → 3 × nivel × BASE_BET
-    nivel sube al perder todos los intentos; baja a 1 al recuperar (debt_stack).
+    Niveles de apuesta (3 niveles, 2 intentos):
+      Nivel 1: Int.1 = $0.10 | Int.2 = $0.30
+      Nivel 2: Int.1 = $0.90 | Int.2 = $2.70
+      Nivel 3: Int.1 = $8.10 | Int.2 = $24.30
+    Fórmula: Int.1 = BASE_BET × 9^(nivel-1) | Int.2 = 3 × BASE_BET × 9^(nivel-1)
+    nivel sube (1→3) al perder los intentos; baja a 1 al recuperar (debt_stack).
     """
     def __init__(self):
         self.nivel      = 1
@@ -440,9 +449,10 @@ class GestorDocenas:
         self.b0 = balance
 
     def get_bet(self, intento: int = 1) -> float:
+        multiplier = 9 ** (self.nivel - 1)
         if intento == 1:
-            return self.nivel * BASE_BET
-        return 3 * self.nivel * BASE_BET
+            return round(BASE_BET * multiplier, 2)
+        return round(3 * BASE_BET * multiplier, 2)
 
     def registrar_perdida_senal(self):
         self.debt_stack.append(self.b0)
@@ -1345,8 +1355,7 @@ class RussianRouletteEngine:
             tg_send(
                 f"✅ WIN #{number} — DOCENA D{d} — Op. #{self.active_intento}\n"
                 f"🎉 {sign}{signal_profit:.2f} USD 🎉\n"
-                f"💰 Balance: ${self.bankroll:.2f} USD | Nivel: {self.gestor.nivel}",
-                markup=russian_keyboard()
+                f"💰 Balance: ${self.bankroll:.2f} USD | Nivel: {self.gestor.nivel}"
             )
             self.stats.record('WIN', self.active_intento, number, d,
                               self.bankroll, self.active_strategy)
@@ -1390,11 +1399,10 @@ class RussianRouletteEngine:
                 icon = self._strat_icon()
                 next_nivel = self.gestor.nivel + 1 if self.gestor.nivel < MAX_NIVEL else 1
                 tg_send(
-                    f"❌ LOSS #{number} — DOCENA D{d} — {icon} 3 intentos\n"
+                    f"❌ LOSS #{number} — DOCENA D{d} — {icon} {MAX_INTENTOS} intentos\n"
                     f"🚨 -{self.total_signal_loss:.2f} USD 🚨\n"
                     f"💰 Balance: ${self.bankroll:.2f} USD | "
-                    f"Nivel: {self.gestor.nivel}→{next_nivel}",
-                    markup=russian_keyboard()
+                    f"Nivel: {self.gestor.nivel}→{next_nivel}"
                 )
                 self.stats.record('LOSS', self.active_intento, number, d,
                                   self.bankroll, self.active_strategy)
@@ -1565,7 +1573,8 @@ def cmd_start(m):
         "🅑 E2: PHTML+EMA (sin umbral)\n"
         "🅒 E3: Retorno PF Break (umbral 78%)\n\n"
         "💰 Apuesta escala por nivel e intento:\n"
-        "  Int.1 → Nv×$0.10 | Int.2-3 → 3×Nv×$0.10\n\n"
+        "  Int.1 → $0.10 | $0.90 | $8.10 (Nv.1/2/3)\n"
+        "  Int.2 → $0.30 | $2.70 | $24.30 (Nv.1/2/3)\n\n"
         "🧠 El bot aprende de cada señal:\n"
         "  · Registra condiciones y resultado\n"
         "  · Ajusta probabilidades futuras (±22%)\n\n"
@@ -1627,9 +1636,12 @@ def cmd_niveles(m):
     lines.append(f"\n<b>Tabla de apuestas:</b>")
     for nv in range(1, MAX_NIVEL + 1):
         tag = " ← actual" if nv == g.nivel else ""
+        mult = 9 ** (nv - 1)
+        bet1 = BASE_BET * mult
+        bet2 = 3 * BASE_BET * mult
         lines.append(
-            f"  Nv.{nv}: Int.1 ${nv*BASE_BET:.2f} | "
-            f"Int.2-3 ${3*nv*BASE_BET:.2f}{tag}"
+            f"  Nv.{nv}: Int.1 ${bet1:.2f} | "
+            f"Int.2 ${bet2:.2f}{tag}"
         )
     bot.reply_to(m, "\n".join(lines), parse_mode="HTML")
 
