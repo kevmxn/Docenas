@@ -105,9 +105,9 @@ MIN_PROB        = 0.78      # umbral base E1 y E3
 MAX_INTENTOS    = 2
 TRAIN_INTERVAL  = 100
 
-# Pesos PHF = PHTML(60%) + PH(40%)
-PHTML_W         = 0.60
-PH_W_COMBINE    = 0.40
+# Pesos PHF = PHTML(80%) + PH(20%)
+PHTML_W         = 0.80
+PH_W_COMBINE    = 0.20
 
 # Pesos señal E1
 PF_W_NORM  = 0.70; PH_W_NORM  = 0.30
@@ -1431,7 +1431,6 @@ class RussianRouletteEngine:
     # ── Poll loop ─────────────────────────────────────────────────────────────
     async def poll_loop(self):
         last_stats_poll = 0
-        last_spin_id    = None
 
         while True:
             try:
@@ -1594,6 +1593,11 @@ async def main():
     global engine
     stats_client = StatsClient()
     engine       = RussianRouletteEngine(stats_client)
+
+    # Limpiar webhook y updates pendientes para evitar error 409
+    bot.remove_webhook()
+    time.sleep(1)
+
     threading.Thread(
         target=lambda: bot.polling(none_stop=True, interval=1, timeout=30),
         daemon=True
