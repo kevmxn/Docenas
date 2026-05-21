@@ -22,6 +22,7 @@ CAMBIOS v30 (v29 + niveles v27 + aprendizaje adaptativo):
 """
 
 import asyncio
+import datetime
 import logging
 import os
 import sqlite3
@@ -866,6 +867,9 @@ class RussianRouletteEngine:
         self.total_signal_loss    = 0.0
         self.active_signal_msg_id = None
 
+        # Control de ventana de 10 min (hora argentina UTC-3)
+        self.last_signal_window   = -1   # 0-5 → :00/:10/:20/:30/:40/:50
+
         # Gestión de fichas y niveles
         self.gestor    = GestorDocenas()
         self.bankroll  = 100.0
@@ -1452,6 +1456,12 @@ class RussianRouletteEngine:
             for gid in list(self.processed_game_ids)[:150]:
                 self.processed_game_ids.discard(gid)
 
+    @staticmethod
+    def _current_window() -> int:
+        """Ventana de 10 min actual en hora argentina (UTC-3). Retorna 0-5."""
+        now_art = datetime.datetime.utcnow() - datetime.timedelta(hours=3)
+        return now_art.minute // 10
+
     def _process_inner(self, number: int):
         d = get_dozen(number)
         logger.info(f"[RussianDC] 🎰 #{len(self.spin_history)+1}: {number} D{d}")
@@ -1463,15 +1473,23 @@ class RussianRouletteEngine:
                 return
             self.warmup_done = True
             tg_send(
-                "🟢 <b>Russian Roulette DC v30</b> — Sistema listo.\n"
+                "🟢 <b>Russian Roulette DC v31</b> — Sistema listo.\n"
                 "3 estrategias · Niveles de apuesta · Aprendizaje adaptativo activo 🧠"
             )
 
         if self.signal_active:
             self._resolve(number)
         else:
+            win = self._current_window()
+            if win == self.last_signal_window:
+                logger.debug(
+                    f"[RussianDC] ⏱️ Ventana :{win*10:02d} ya usada — "
+                    f"próxima señal en ventana :{(win+1)%6*10:02d}"
+                )
+                return
             sig = self._select_best_signal()
             if sig:
+                self.last_signal_window = win
                 self._activate_signal(sig)
 
     # ── HTTP Polling ──────────────────────────────────────────────────────────
