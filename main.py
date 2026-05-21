@@ -218,6 +218,7 @@ def tg_send(text: str, markup: InlineKeyboardMarkup = None) -> Optional[int]:
             bot.send_message,
             chat_id=CHAT_ID, text=text,
             parse_mode="HTML", reply_markup=markup,
+            disable_web_page_preview=True,
         )
         if msg:
             logger.info(f"✅ Message sent (ID: {msg.message_id})")
