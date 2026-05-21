@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Russian Roulette — Bot DC v30
@@ -90,6 +91,7 @@ STATS_URL       = "https://ruletasbot-rjce.onrender.com"
 TARGET_ROULETTE = "RUSSIAN"
 POLL_INTERVAL   = 1
 LIVE_DB         = "russian_live.db"
+
 
 BASE_BET        = 0.10      # USD — ficha base (v29)
 MAX_NIVEL       = 3
@@ -867,8 +869,9 @@ class RussianRouletteEngine:
         self.total_signal_loss    = 0.0
         self.active_signal_msg_id = None
 
-        # Control de ventana de 10 min (hora argentina UTC-3)
-        self.last_signal_window   = -1   # 0-5 → :00/:10/:20/:30/:40/:50
+        # Control de ventana de 10 min — hasta 2 señales por ventana (hora ARG UTC-3)
+        self.current_window       = -1   # ventana activa 0-5
+        self.window_signal_count  = 0    # señales enviadas en la ventana actual
 
         # Gestión de fichas y niveles
         self.gestor    = GestorDocenas()
@@ -1481,15 +1484,21 @@ class RussianRouletteEngine:
             self._resolve(number)
         else:
             win = self._current_window()
-            if win == self.last_signal_window:
+            if win != self.current_window:
+                # Nueva ventana — resetear contador
+                self.current_window      = win
+                self.window_signal_count = 0
+            if self.window_signal_count >= 2:
                 logger.debug(
-                    f"[RussianDC] ⏱️ Ventana :{win*10:02d} ya usada — "
-                    f"próxima señal en ventana :{(win+1)%6*10:02d}"
+                    f"[RussianDC] ⏱️ Ventana :{win*10:02d} — 2/2 señales enviadas, esperando próxima"
                 )
                 return
             sig = self._select_best_signal()
             if sig:
-                self.last_signal_window = win
+                self.window_signal_count += 1
+                logger.info(
+                    f"[RussianDC] 📡 Señal {self.window_signal_count}/2 en ventana :{win*10:02d}"
+                )
                 self._activate_signal(sig)
 
     # ── HTTP Polling ──────────────────────────────────────────────────────────
